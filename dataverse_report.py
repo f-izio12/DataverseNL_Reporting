@@ -1,8 +1,12 @@
 """
 DataverseNL report for Maastricht University.
 
-Builds a single self-contained HTML page (output/report.html) plus CSV files
-with the underlying numbers (output/*.csv).
+Builds two self-contained HTML pages:
+  output/public/report.html  the shareable report, plus CSVs with its numbers
+  output/admin/admin.html    internal page: pending access requests, unpublished
+                             drafts and datasets without a licence, each with
+                             links to the datasets, plus CSVs
+The GitHub workflow uploads them as two separate downloads.
 
 Public data (no token needed):
   - new published datasets per month and year, per collection
@@ -48,6 +52,11 @@ import requests
 BASE_URL = os.environ.get("DATAVERSE_URL", "https://dataverse.nl").rstrip("/")
 ROOT_ALIAS = os.environ.get("ROOT_ALIAS", "maastricht")
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "output"))
+PUBLIC_DIR = OUTPUT_DIR / "public"   # report.html + CSVs, safe to share
+ADMIN_DIR = OUTPUT_DIR / "admin"     # admin.html, lists of datasets, access requests, drafts
+
+# Monthly table: totals at or above this number get an extra marker.
+HIGHLIGHT_THRESHOLD = int(os.environ.get("HIGHLIGHT_THRESHOLD", "10"))
 
 # Put the UM logo file in the repository at this path (PNG or SVG).
 # If the file is missing, the report is rendered without a logo.
@@ -239,12 +248,14 @@ def collect_access_requests(units: list[dict]) -> dict:
         result["reason"] = "No API token found in DATAVERSE_API_TOKEN."
         return result
 
-    result.update({"enabled": True, "per_unit": {}})
+    result.update({"enabled": True, "per_unit": {}, "items": []})
 
     def check(file_id):
         status, body = get(f"/api/access/datafile/{file_id}/listRequests", auth=True, allow_error=True)
         if status == 200:
             data = body.get("data")
+            # Only the NUMBER of requesters is kept. Names and e-mail addresses of
+            # requesters are personal data and are deliberately not stored.
             return ("ok", len(data) if isinstance(data, list) else 0)
         if status == 404:  # Dataverse answers 404 when a file has no pending requests
             return ("ok", 0)
@@ -253,19 +264,69 @@ def collect_access_requests(units: list[dict]) -> dict:
         return ("error", 0)
 
     for u in units:
-        files = search_all({"q": "*", "type": "file", "subtree": u["alias"], "fq": 'fileAccess:"Restricted"'})
-        ids = [f["file_id"] for f in files if f.get("file_id")]
-        print(f"  {u['short']}: checking {len(ids)} restricted files", flush=True)
+        files = [f for f in search_all({"q": "*", "type": "file", "subtree": u["alias"],
+                                        "fq": 'fileAccess:"Restricted"'}) if f.get("file_id")]
+        print(f"  {u['short']}: checking {len(files)} restricted files", flush=True)
         with ThreadPoolExecutor(max_workers=4) as pool:
-            res = list(pool.map(check, ids))
+            res = list(pool.map(lambda f: check(f["file_id"]), files))
+        for f, (status, n) in zip(files, res):
+            if status == "ok" and n > 0:
+                result["items"].append({
+                    "unit": u["short"],
+                    "dataset": f.get("dataset_name", ""),
+                    "dataset_pid": f.get("dataset_persistent_id", ""),
+                    "dataset_id": f.get("dataset_id", ""),
+                    "file": f.get("name", ""),
+                    "file_id": f["file_id"],
+                    "pending": n,
+                })
         result["per_unit"][u["alias"]] = {
-            "restricted_files": len(ids),
+            "restricted_files": len(files),
             "files_with_requests": sum(1 for s, n in res if s == "ok" and n > 0),
             "pending_requests": sum(n for s, n in res if s == "ok"),
             "no_permission": sum(1 for s, _ in res if s == "forbidden"),
             "errors": sum(1 for s, _ in res if s == "error"),
         }
     return result
+
+
+def collect_admin_lists(units: list[dict]) -> dict:
+    """Lists for the admin page: datasets without a licence (public data) and
+    unpublished drafts (only visible with a token that can see them)."""
+    no_licence = []
+    for u in units:
+        for d in search_all({"q": "*", "type": "dataset", "subtree": u["alias"], "fq": "-license:[* TO *]"}):
+            no_licence.append({
+                "unit": u["short"],
+                "title": d.get("name", ""),
+                "pid": d.get("global_id", ""),
+                "collection": d.get("name_of_dataverse", ""),
+                "published": (d.get("published_at") or "")[:10],
+            })
+
+    drafts: dict = {"enabled": False, "reason": "", "items": []}
+    if not API_TOKEN:
+        drafts["reason"] = "No API token provided, so unpublished drafts are not visible."
+    else:
+        drafts["enabled"] = True
+        today = datetime.now(TZ).date()
+        for u in units:
+            status, body = get("/api/search", params={"q": "*", "type": "dataset", "subtree": u["alias"],
+                                                      "fq": 'publicationStatus:"Draft"', "per_page": 1000},
+                               auth=True, allow_error=True)
+            if status != 200:
+                drafts["enabled"] = False
+                drafts["reason"] = f"The search API refused the draft query (HTTP {status})."
+                break
+            for d in body.get("data", {}).get("items", []):
+                # A published dataset with an unpublished new version is also "Draft"; keep only never-published ones.
+                if "Published" in (d.get("publicationStatuses") or []):
+                    continue
+                created = (d.get("createdAt") or "")[:10]
+                age = (today - datetime.fromisoformat(created).date()).days if created else None
+                drafts["items"].append({"unit": u["short"], "title": d.get("name", ""),
+                                        "pid": d.get("global_id", ""), "created": created, "age_days": age})
+    return {"no_licence": no_licence, "drafts": drafts}
 
 
 # --------------------------------------------------------------------------
@@ -315,8 +376,45 @@ def logo_tag() -> str:
     return f'<img class="logo" src="data:{mime};base64,{b64}" alt="Maastricht University">'
 
 
-def write_csv(name: str, headers: list[str], rows: list[list]) -> None:
-    with open(OUTPUT_DIR / name, "w", newline="", encoding="utf-8") as f:
+def heat_table(headers: list[str], rows: list[list], threshold: int) -> str:
+    """Monthly table: each number is shaded relative to the best month in its own
+    column, and the best month per column is bold. Totals at or above `threshold`
+    get an extra marker."""
+    ncols = len(headers)
+    col_max = [max((r[i] for r in rows if isinstance(r[i], int)), default=0) for i in range(ncols)]
+    th = "".join(f'<th class="{"num" if i else ""}">{esc(h)}</th>' for i, h in enumerate(headers))
+    body = ""
+    for r in rows:
+        cells = [f"<td>{esc(r[0])}</td>"]
+        for i in range(1, ncols):
+            v = r[i]
+            cls = ["num"]
+            style = ""
+            if v and col_max[i]:
+                # Scale against at least 4, so a collection whose best month is 1 or 2
+                # does not look as strong as one that publishes 15 a month.
+                scale = max(col_max[i], 4)
+                style = f' style="background:rgba(var(--heat-rgb),{0.08 + 0.42 * v / scale:.2f})"'
+                if v == col_max[i] and col_max[i] >= 3:
+                    cls.append("best")
+            elif not v:
+                cls.append("zero")
+            if i == ncols - 1 and v >= threshold:
+                cls.append("hit")
+            cells.append(f'<td class="{" ".join(cls)}"{style}>{fmt(v)}</td>')
+        body += "<tr>" + "".join(cells) + "</tr>"
+    return f'<div class="tbl"><table class="heat"><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def signed_pct(new: int, base: int) -> str:
+    if not base:
+        return "n/a"
+    d = 100 * (new - base) / base
+    return f"{d:+.0f}%"
+
+
+def write_csv(name: str, headers: list[str], rows: list[list], folder: Path | None = None) -> None:
+    with open((folder or PUBLIC_DIR) / name, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(headers)
         w.writerows(rows)
@@ -390,14 +488,10 @@ def build_report(units: list[dict], access: dict, version: str) -> str:
     # ---- licences
     lic_names = sorted({k for u in ordered for k in u["licences"]},
                        key=lambda k: -sum(u["licences"].get(k, 0) for u in ordered))
-    l_headers = ["Collection"] + lic_names + ["No licence recorded"]
-    l_rows = []
-    for u in ordered:
-        vals = [u["licences"].get(k, 0) for k in lic_names]
-        l_rows.append([u["short"]] + vals + [max(u["datasets"] - sum(vals), 0)])
+    l_headers = ["Collection"] + lic_names
+    l_rows = [[u["short"]] + [u["licences"].get(k, 0) for k in lic_names] for u in ordered]
     l_total = ["Total"] + [sum(r[i] for r in l_rows) for i in range(1, len(l_headers))]
     write_csv("licences.csv", l_headers, l_rows + [l_total])
-    no_licence = l_total[-1]
 
     # ---- storage, linkage, structure
     s_headers = ["Collection", "Datasets", "Files", "Storage", "Linked to publication", "% linked",
@@ -411,9 +505,12 @@ def build_report(units: list[dict], access: dict, version: str) -> str:
               [[r[0], r[1], r[2], u["bytes"]] + r[4:] for r, u in zip(s_rows, ordered)])
 
     # ---- deposit vs publication
-    d_headers = ["Year", "Published datasets created that year", "Datasets first published that year"]
-    d_rows = [[str(yy), sum(int(u["deposit_by_year"].get(str(yy), 0)) for u in ordered),
-               sum(year_sum(u["published_monthly"], yy) for u in ordered)] for yy in years[-6:]]
+    d_headers = ["Year", "Created that year (and since published)", "First published that year", "Difference"]
+    d_rows = []
+    for yy in years[-6:]:
+        created = sum(int(u["deposit_by_year"].get(str(yy), 0)) for u in ordered)
+        published = sum(year_sum(u["published_monthly"], yy) for u in ordered)
+        d_rows.append([str(yy), created, published, signed_pct(published, created)])
     write_csv("deposit_vs_publication.csv", d_headers, d_rows)
 
     # ---- downloads annex
@@ -422,24 +519,10 @@ def build_report(units: list[dict], access: dict, version: str) -> str:
     dl_rows = [[u["short"]] + [year_sum(u["downloads_monthly"], yy) for yy in dl_years] for u in ordered]
     write_csv("downloads_per_year.csv", dl_headers, dl_rows)
 
-    # ---- access requests section
-    if access.get("enabled"):
-        a_headers = ["Collection", "Restricted files checked", "Files with pending requests",
-                     "Pending requests", "No permission", "Errors"]
-        a_rows = [[u["short"]] + [access["per_unit"][u["alias"]][k] for k in
-                                  ("restricted_files", "files_with_requests", "pending_requests", "no_permission", "errors")]
-                  for u in ordered if u["alias"] in access["per_unit"]]
-        write_csv("access_requests_pending.csv", a_headers, a_rows)
-        no_perm = sum(r[4] for r in a_rows)
-        access_html = table(a_headers, a_rows) + (
-            f'<p class="note warn">{fmt(no_perm)} restricted files could not be checked because the token\'s account '
-            f'lacks curator rights on them, so these figures undercount.</p>' if no_perm else "") + \
-            '<p class="note">Only <strong>pending</strong> requests are visible through the API. Requests that were ' \
-            'granted or rejected are no longer listed, so this is a snapshot of the current queue, not a history.</p>'
-    else:
-        access_html = (f'<p class="note">Not included in this run: {esc(access.get("reason", ""))} '
-                       f'The proxy below is the number of restricted files, which are the only files that can '
-                       f'receive an access request.</p>')
+    # ---- access requests: the public page only shows the proxy; details are on the admin page
+    access_html = (f'<p class="note">{fmt(restricted)} files ({pct(restricted, total_files)}) are restricted. '
+                   f'Only restricted files can receive an access request, so this is the upper bound of the '
+                   f'access-request workload. Pending requests are listed on the admin page.</p>')
 
     # ---- chart data
     chart_years = years[-8:]
@@ -452,7 +535,6 @@ def build_report(units: list[dict], access: dict, version: str) -> str:
         ("Files", fmt(total_files), fmt_bytes(total_bytes) + " in total"),
         ("Restricted files", pct(restricted, total_files), f"{fmt(restricted)} files"),
         ("Linked to a publication", pct(linked, total_ds), f"{fmt(linked)} datasets"),
-        ("No licence recorded", fmt(no_licence), "datasets"),
     ]
     kpi_html = "".join(
         f'<div class="kpi"><div class="kpi-l">{esc(a)}</div><div class="kpi-v">{b}</div><div class="kpi-s">{esc(c)}</div></div>'
@@ -487,12 +569,18 @@ def build_report(units: list[dict], access: dict, version: str) -> str:
 <p class="note">* {this_year} is a partial year up to the generation date.</p></section>
 
 <section><h2>New published datasets per month (last {MONTHS_IN_DETAIL} months)</h2>
-{table(m_headers, m_rows)}
+<p class="lead">Darker cells are stronger months <em>for that collection</em>; the best month per collection is in bold
+(only where it published at least 3 that month).
+Months with a total of {HIGHLIGHT_THRESHOLD} or more are marked <span class="hit-key">like this</span>.</p>
+{heat_table(m_headers, m_rows, HIGHLIGHT_THRESHOLD)}
 <p class="note">* Current month is partial. The full monthly history is in <code>published_per_month.csv</code>.</p></section>
 
 <section><h2>Created vs published</h2>
-<p class="lead">Only published datasets are visible to the public API, so unpublished drafts are not counted here.
-A difference between the columns means datasets created in one year were published in a later one.</p>
+<p class="lead">“Created” counts datasets by the year they were created, but only those that have since been published:
+the public API cannot see unpublished drafts. “Difference” is published relative to created.
+A positive value means more datasets went public that year than were started that year, usually because
+earlier work was published; a negative value means work started that year is published later.
+It is <strong>not</strong> a publication rate. Unpublished drafts are counted on the admin page.</p>
 {table(d_headers, d_rows)}</section>
 
 <section><h2>Open and restricted files</h2>
@@ -503,12 +591,19 @@ A difference between the columns means datasets created in one year were publish
 
 <section><h2>Licences</h2>
 {table(l_headers, l_rows, l_total)}
-<p class="note">“No licence recorded” is the number of published datasets without a licence in the search index, mostly older deposits.</p></section>
+<p class="note">Datasets without a recorded licence are not included here; they are listed on the admin page.</p></section>
 
 <section><h2>Storage, linkage to publications and collection structure</h2>
 {table(s_headers, s_rows, s_total)}
-<p class="note">“Linked to publication” means the Related Publication field is filled in.
-Sub-collections counts every collection below the faculty level, including per-project and per-PhD collections.</p></section>
+<dl class="defs">
+<dt>Linked to publication</dt><dd>The dataset's <em>Related Publication</em> field is filled in, normally with the
+citation or DOI of the article the data supports. It shows how often data is deposited alongside a paper.
+The field is free text, so it can also hold other links (for example a code repository).</dd>
+<dt>Updated after first version</dt><dd>Datasets published more than once (version 1.1, 2.0 and so on).</dd>
+<dt>Sub-collections</dt><dd>Collections nested inside the faculty collection: departments, research groups,
+projects and, at SHE, one collection per PhD candidate. A high number usually means researchers create a collection
+per project instead of depositing in the department collection.</dd>
+</dl></section>
 
 <section><h2>Methodology and caveats</h2>
 <ul class="caveats">
@@ -546,6 +641,131 @@ Sudden jumps (for example a collection rising from hundreds to hundreds of thous
 </body></html>"""
 
 
+def dataset_link(pid: str, title: str) -> str:
+    if not pid:
+        return esc(title)
+    return f'<a href="{esc(BASE_URL)}/dataset.xhtml?persistentId={esc(pid)}" target="_blank" rel="noopener">{esc(title or pid)}</a>'
+
+
+def html_list_table(headers: list[str], rows: list[list[str]], num_cols: set[int] = frozenset()) -> str:
+    """Table whose cells are already-escaped HTML (used for rows containing links)."""
+    th = "".join(f'<th class="{"num" if i in num_cols else ""}">{esc(h)}</th>' for i, h in enumerate(headers))
+    body = "".join("<tr>" + "".join(
+        f'<td class="{"num" if i in num_cols else ("wrap" if i == 1 else "")}">{c}</td>' for i, c in enumerate(r))
+        + "</tr>" for r in rows)
+    return f'<div class="tbl"><table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def build_admin(units: list[dict], access: dict, lists: dict, version: str) -> str:
+    now = datetime.now(TZ)
+    ordered = [u for u in units if u["datasets"] > 0]
+    ordered = [u for u in ordered if u["is_faculty"]] + [u for u in ordered if not u["is_faculty"]]
+
+    # ---- access requests
+    if access.get("enabled"):
+        a_headers = ["Collection", "Restricted files checked", "Files with pending requests",
+                     "Pending requests", "No permission", "Errors"]
+        a_rows = [[u["short"]] + [access["per_unit"][u["alias"]][k] for k in
+                                  ("restricted_files", "files_with_requests", "pending_requests", "no_permission", "errors")]
+                  for u in ordered if u["alias"] in access["per_unit"]]
+        write_csv("access_requests_summary.csv", a_headers, a_rows, ADMIN_DIR)
+        items = sorted(access["items"], key=lambda x: (-x["pending"], x["unit"], x["dataset"]))
+        write_csv("access_requests_pending.csv", ["Collection", "Dataset", "DOI", "File", "File id", "Pending requests"],
+                  [[i["unit"], i["dataset"], i["dataset_pid"], i["file"], i["file_id"], i["pending"]] for i in items],
+                  ADMIN_DIR)
+        rows = []
+        for i in items:
+            manage = (f'<a href="{esc(BASE_URL)}/permissions-manage-files.xhtml?id={esc(i["dataset_id"])}" '
+                      f'target="_blank" rel="noopener">Manage access</a>') if i["dataset_id"] else ""
+            rows.append([esc(i["unit"]), dataset_link(i["dataset_pid"], i["dataset"]), esc(i["file"]),
+                         fmt(i["pending"]), manage])
+        no_perm = sum(r[4] for r in a_rows)
+        access_html = (
+            table(a_headers, a_rows)
+            + (f'<p class="note warn">{fmt(no_perm)} restricted files could not be checked because the token\'s '
+               f'account lacks curator rights on them, so these figures undercount.</p>' if no_perm else "")
+            + "<h3>Files with pending requests</h3>"
+            + (html_list_table(["Collection", "Dataset", "File", "Pending", ""], rows, {3}) if rows
+               else '<p class="note">No pending requests found.</p>')
+            + '<p class="note">Only <strong>pending</strong> requests are visible through the API: granted or rejected '
+              'requests are no longer listed. Requesters\' names and e-mail addresses are deliberately not stored in '
+              'this report; open “Manage access” in DataverseNL to see who is asking.</p>')
+    else:
+        access_html = f'<p class="note">Not included in this run: {esc(access.get("reason", ""))}</p>'
+
+    # ---- drafts
+    dr = lists["drafts"]
+    if dr["enabled"]:
+        d_items = sorted(dr["items"], key=lambda x: -(x["age_days"] or 0))
+        per_unit = defaultdict(int)
+        for i in d_items:
+            per_unit[i["unit"]] += 1
+        write_csv("unpublished_drafts.csv", ["Collection", "Title", "DOI", "Created", "Age (days)"],
+                  [[i["unit"], i["title"], i["pid"], i["created"], i["age_days"]] for i in d_items], ADMIN_DIR)
+        drafts_html = (
+            table(["Collection", "Unpublished drafts"], [[u["short"], per_unit.get(u["short"], 0)] for u in ordered],
+                  ["Total", len(d_items)])
+            + "<h3>Drafts, oldest first</h3>"
+            + (html_list_table(["Collection", "Dataset", "Created", "Age (days)"],
+                               [[esc(i["unit"]), dataset_link(i["pid"], i["title"]), esc(i["created"]),
+                                 fmt(i["age_days"]) if i["age_days"] is not None else ""] for i in d_items], {3})
+               if d_items else '<p class="note">No unpublished drafts visible to this token.</p>')
+            + '<p class="note">Only drafts the token\'s account can see are included. Datasets that are published '
+              'but have an unpublished new version are excluded.</p>')
+    else:
+        drafts_html = f'<p class="note">Not included in this run: {esc(dr["reason"])}</p>'
+
+    # ---- no licence
+    nl = sorted(lists["no_licence"], key=lambda x: (x["unit"], x["published"]))
+    write_csv("datasets_without_licence.csv", ["Collection", "Title", "DOI", "Sub-collection", "Last published"],
+              [[i["unit"], i["title"], i["pid"], i["collection"], i["published"]] for i in nl], ADMIN_DIR)
+    nl_count = defaultdict(int)
+    for i in nl:
+        nl_count[i["unit"]] += 1
+    licence_html = (
+        table(["Collection", "Datasets without licence", "% of collection"],
+              [[u["short"], nl_count.get(u["short"], 0), pct(nl_count.get(u["short"], 0), u["datasets"])] for u in ordered],
+              ["Total", len(nl), pct(len(nl), sum(u["datasets"] for u in ordered))])
+        + "<h3>Datasets without a licence</h3>"
+        + html_list_table(["Collection", "Dataset", "Sub-collection", "Last published"],
+                          [[esc(i["unit"]), dataset_link(i["pid"], i["title"]), esc(i["collection"]),
+                            esc(i["published"])] for i in nl])
+        + '<p class="note">These datasets have no licence in the search index; most predate the licence field. '
+          'The fix is a new version with a licence, which needs the depositor or a curator.</p>')
+
+    generated = now.strftime("%d %B %Y, %H:%M")
+    return f"""<!doctype html>
+<html lang="en-GB"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>DataverseNL admin</title>
+<style>{CSS}</style>
+</head><body>
+<header class="top">
+  {logo_tag()}
+  <div>
+    <p class="eyebrow">University Library · Research Data Management · Internal</p>
+    <h1>DataverseNL admin page</h1>
+    <p class="meta">Generated {esc(generated)} · Source: {esc(BASE_URL)} (Dataverse {esc(version)})</p>
+  </div>
+</header>
+<main>
+<div class="banner"><strong>Internal use only.</strong> This page lists individual datasets, unpublished drafts and
+the access-request queue. Share the public report (<code>report.html</code>) instead of this page.</div>
+
+<section><h2>Pending access requests</h2>
+{access_html}</section>
+
+<section><h2>Unpublished drafts</h2>
+{drafts_html}</section>
+
+<section><h2>Datasets without a licence</h2>
+{licence_html}</section>
+</main>
+<footer>Data: DataverseNL API. Authenticated sections use the token's own permissions.</footer>
+</body></html>"""
+
+
 CSS = """
 :root{--bg:#fafaf7;--card:#ffffff;--ink:#1d2433;--muted:#5b6475;--line:#e3e5ea;--accent:#001c3d;--warn:#8a4b00;
 --c1:#001c3d;--c2:#e84e10;--c3:#4f7cac;--c4:#7a9a3a;--c5:#b6862c;--c6:#8c5a9e;--c7:#2f8f83;--c8:#a33b4a;--c9:#6b7a8f;--c10:#c9a227;--c11:#3d5a80}
@@ -561,6 +781,7 @@ h1{margin:4px 0;font-size:26px;color:var(--accent)}
 main{max-width:1100px;margin:0 auto;padding:8px 16px 40px}
 section{margin:32px 0}
 h2{font-size:19px;margin:0 0 8px;color:var(--accent)}
+h3{font-size:15px;margin:20px 0 8px}
 .lead{margin:0 0 12px;color:var(--muted)}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
 .kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
@@ -580,13 +801,26 @@ tbody tr:last-child td{border-bottom:none}
 .caveats{padding-left:20px;color:var(--ink)}
 .caveats li{margin:4px 0}
 code{font-size:12.5px}
+:root{--heat-rgb:232,78,16}
+@media (prefers-color-scheme: dark){:root{--heat-rgb:240,138,93}}
+table.heat td.best{font-weight:700}
+table.heat td.zero{color:var(--line)}
+table.heat td.hit{box-shadow:inset 0 0 0 2px var(--accent);font-weight:700}
+.hit-key{display:inline-block;padding:0 6px;border-radius:4px;box-shadow:inset 0 0 0 2px var(--accent);font-weight:700;color:var(--ink)}
+.defs{margin:12px 0 0;font-size:13.5px}
+.defs dt{font-weight:650;margin-top:8px}
+.defs dd{margin:2px 0 0;color:var(--muted)}
+.banner{background:rgba(var(--heat-rgb),.12);border:1px solid rgba(var(--heat-rgb),.5);border-radius:10px;padding:10px 14px;margin:16px 0;font-size:14px}
+a{color:var(--accent)}
+td.wrap{white-space:normal;min-width:260px}
 footer{max-width:1100px;margin:0 auto;padding:16px;color:var(--muted);font-size:12px;border-top:1px solid var(--line)}
 @media print{.chart{break-inside:avoid}section{break-inside:avoid-page}}
 """
 
 
 def main() -> int:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
+    ADMIN_DIR.mkdir(parents=True, exist_ok=True)
     print(f"DataverseNL report for '{ROOT_ALIAS}' at {BASE_URL}")
     print("Token: " + ("provided" if API_TOKEN else "not provided") +
           f"; access requests: {'on' if INCLUDE_ACCESS_REQUESTS else 'off'}")
@@ -608,11 +842,17 @@ def main() -> int:
         print(f"WARNING: collections sum to {unit_total}, root has {root_total} "
               f"(datasets deposited directly in '{ROOT_ALIAS}' are not in any collection).")
 
-    (OUTPUT_DIR / "report.html").write_text(build_report(data, access, version), encoding="utf-8")
-    (OUTPUT_DIR / "raw_data.json").write_text(json.dumps(
-        {"generated": datetime.now(TZ).isoformat(), "version": version, "units": data,
-         "access_requests": access}, indent=2, default=str), encoding="utf-8")
-    print(f"Done: {OUTPUT_DIR / 'report.html'}")
+    print("Admin lists (datasets without licence, drafts):")
+    lists = collect_admin_lists([u for u in data if u["datasets"] > 0])
+    print(f"  {len(lists['no_licence'])} datasets without licence; drafts: "
+          + (str(len(lists['drafts']['items'])) if lists['drafts']['enabled'] else "skipped - " + lists['drafts']['reason']))
+
+    (PUBLIC_DIR / "report.html").write_text(build_report(data, access, version), encoding="utf-8")
+    (PUBLIC_DIR / "raw_data.json").write_text(json.dumps(
+        {"generated": datetime.now(TZ).isoformat(), "version": version, "units": data},
+        indent=2, default=str), encoding="utf-8")
+    (ADMIN_DIR / "admin.html").write_text(build_admin(data, access, lists, version), encoding="utf-8")
+    print(f"Done: {PUBLIC_DIR / 'report.html'} and {ADMIN_DIR / 'admin.html'}")
     return 0
 
 
