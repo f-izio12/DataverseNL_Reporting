@@ -113,17 +113,23 @@ def get(path: str, params: dict | None = None, auth: bool = False, allow_error: 
     """GET a Dataverse API path and return the parsed JSON body."""
     headers = {"X-Dataverse-key": API_TOKEN} if auth and API_TOKEN else {}
     url = f"{BASE_URL}{path}"
-    for attempt in range(4):
+    attempts = 6  # waits 5, 10, 20, 40, 60 s: rides out a short DataverseNL hiccup
+    for attempt in range(attempts):
+        last = attempt == attempts - 1
         try:
             r = SESSION.get(url, params=params, headers=headers, timeout=60)
-        except requests.RequestException as exc:
-            if attempt == 3:
+        except requests.RequestException:
+            if last:
                 raise
-            time.sleep(2 ** attempt)
+            time.sleep(min(60, 5 * 2 ** attempt))
             continue
-        if r.status_code in (429, 502, 503, 504) and attempt < 3:
-            time.sleep(2 ** attempt)
+        if r.status_code in (429, 500, 502, 503, 504) and not last:
+            print(f"  DataverseNL returned {r.status_code} for {path}; retrying", flush=True)
+            time.sleep(min(60, 5 * 2 ** attempt))
             continue
+        if r.status_code >= 500 and path == "/api/info/version":
+            raise SystemExit(f"DataverseNL is not responding (HTTP {r.status_code}). "
+                             f"This is a problem on the DataverseNL side; re-run the workflow later.")
         if allow_error:
             try:
                 return r.status_code, r.json()
@@ -235,6 +241,9 @@ def collect_unit(unit: dict) -> dict:
         "linked_to_publication": linked,
         "updated_after_v1": versions_gt1,
         **count_subtree_collections(alias),
+        # Which (sub-)collection each dataset sits in; used on the admin page only.
+        "pid_collection": {d["global_id"]: [d.get("identifier_of_dataverse", ""), d.get("name_of_dataverse", "")]
+                           for d in datasets if d.get("global_id")},
     }
 
 
@@ -248,7 +257,7 @@ def collect_access_requests(units: list[dict]) -> dict:
         result["reason"] = "No API token found in DATAVERSE_API_TOKEN."
         return result
 
-    result.update({"enabled": True, "per_unit": {}, "items": []})
+    result.update({"enabled": True, "per_unit": {}, "items": [], "no_permission": {}})
 
     def check(file_id):
         status, body = get(f"/api/access/datafile/{file_id}/listRequests", auth=True, allow_error=True)
@@ -270,6 +279,13 @@ def collect_access_requests(units: list[dict]) -> dict:
         with ThreadPoolExecutor(max_workers=4) as pool:
             res = list(pool.map(lambda f: check(f["file_id"]), files))
         for f, (status, n) in zip(files, res):
+            if status == "forbidden":
+                pid = f.get("dataset_persistent_id", "")
+                coll_alias, coll_name = u.get("pid_collection", {}).get(pid, ["", ""])
+                entry = result["no_permission"].setdefault(pid, {
+                    "unit": u["short"], "dataset": f.get("dataset_name", ""), "pid": pid,
+                    "collection_alias": coll_alias, "collection": coll_name, "files": 0})
+                entry["files"] += 1
             if status == "ok" and n > 0:
                 result["items"].append({
                     "unit": u["short"],
@@ -680,16 +696,54 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str) -> s
             rows.append([esc(i["unit"]), dataset_link(i["dataset_pid"], i["dataset"]), esc(i["file"]),
                          fmt(i["pending"]), manage])
         no_perm = sum(r[4] for r in a_rows)
+
+        # ---- datasets the token cannot check, grouped by the collection where rights are granted
+        np_items = sorted(access.get("no_permission", {}).values(),
+                          key=lambda x: (x["unit"], x["collection"], x["dataset"]))
+        write_csv("no_permission_datasets.csv",
+                  ["Collection", "Sub-collection", "Sub-collection alias", "Dataset", "DOI", "Restricted files"],
+                  [[i["unit"], i["collection"], i["collection_alias"], i["dataset"], i["pid"], i["files"]]
+                   for i in np_items], ADMIN_DIR)
+        groups: dict = {}
+        for i in np_items:
+            g = groups.setdefault((i["unit"], i["collection_alias"]),
+                                  {"unit": i["unit"], "alias": i["collection_alias"], "name": i["collection"],
+                                   "datasets": 0, "files": 0})
+            g["datasets"] += 1
+            g["files"] += i["files"]
+
+        def coll_link(alias: str, name: str) -> str:
+            if not alias:
+                return esc(name or "unknown")
+            return (f'<a href="{esc(BASE_URL)}/dataverse/{esc(alias)}" target="_blank" rel="noopener">'
+                    f'{esc(name or alias)}</a>')
+
+        group_rows = [[esc(g["unit"]), coll_link(g["alias"], g["name"]), fmt(g["datasets"]), fmt(g["files"])]
+                      for g in sorted(groups.values(), key=lambda g: -g["files"])]
+        ds_rows = [[esc(i["unit"]), dataset_link(i["pid"], i["dataset"]), coll_link(i["collection_alias"], i["collection"]),
+                    fmt(i["files"])] for i in np_items]
+        no_perm_html = "" if not np_items else (
+            f'<h3>Datasets your account cannot check ({fmt(len(np_items))} datasets, {fmt(no_perm)} files)</h3>'
+            '<p class="note">Rights in DataverseNL are usually granted per collection, so the first table shows '
+            'where to ask. Giving the token\'s account the <em>Curator</em> role (or any role with '
+            '“Manage File Permissions”) on these collections closes the gap.</p>'
+            + html_list_table(["Collection", "Sub-collection", "Datasets", "Restricted files"], group_rows, {2, 3})
+            + '<details><summary>Show every dataset</summary>'
+            + html_list_table(["Collection", "Dataset", "Sub-collection", "Restricted files"], ds_rows, {3})
+            + '</details>')
+
         access_html = (
             table(a_headers, a_rows)
             + (f'<p class="note warn">{fmt(no_perm)} restricted files could not be checked because the token\'s '
-               f'account lacks curator rights on them, so these figures undercount.</p>' if no_perm else "")
+               f'account lacks curator rights on them, so these figures undercount. '
+               f'They are listed further down.</p>' if no_perm else "")
             + "<h3>Files with pending requests</h3>"
             + (html_list_table(["Collection", "Dataset", "File", "Pending", ""], rows, {3}) if rows
                else '<p class="note">No pending requests found.</p>')
             + '<p class="note">Only <strong>pending</strong> requests are visible through the API: granted or rejected '
               'requests are no longer listed. Requesters\' names and e-mail addresses are deliberately not stored in '
-              'this report; open “Manage access” in DataverseNL to see who is asking.</p>')
+              'this report; open “Manage access” in DataverseNL to see who is asking.</p>'
+            + no_perm_html)
     else:
         access_html = f'<p class="note">Not included in this run: {esc(access.get("reason", ""))}</p>'
 
@@ -813,6 +867,8 @@ table.heat td.hit{box-shadow:inset 0 0 0 2px var(--accent);font-weight:700}
 .banner{background:rgba(var(--heat-rgb),.12);border:1px solid rgba(var(--heat-rgb),.5);border-radius:10px;padding:10px 14px;margin:16px 0;font-size:14px}
 a{color:var(--accent)}
 td.wrap{white-space:normal;min-width:260px}
+details{margin-top:12px}
+summary{cursor:pointer;color:var(--accent);font-weight:600;font-size:14px;margin-bottom:8px}
 footer{max-width:1100px;margin:0 auto;padding:16px;color:var(--muted);font-size:12px;border-top:1px solid var(--line)}
 @media print{.chart{break-inside:avoid}section{break-inside:avoid-page}}
 """
@@ -849,7 +905,8 @@ def main() -> int:
 
     (PUBLIC_DIR / "report.html").write_text(build_report(data, access, version), encoding="utf-8")
     (PUBLIC_DIR / "raw_data.json").write_text(json.dumps(
-        {"generated": datetime.now(TZ).isoformat(), "version": version, "units": data},
+        {"generated": datetime.now(TZ).isoformat(), "version": version,
+         "units": [{k: v for k, v in u.items() if k != "pid_collection"} for u in data]},
         indent=2, default=str), encoding="utf-8")
     (ADMIN_DIR / "admin.html").write_text(build_admin(data, access, lists, version), encoding="utf-8")
     print(f"Done: {PUBLIC_DIR / 'report.html'} and {ADMIN_DIR / 'admin.html'}")
