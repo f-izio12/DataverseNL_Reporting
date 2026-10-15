@@ -320,28 +320,51 @@ def collect_admin_lists(units: list[dict]) -> dict:
                 "published": (d.get("published_at") or "")[:10],
             })
 
-    drafts: dict = {"enabled": False, "reason": "", "items": []}
+    drafts: dict = {"enabled": False, "reason": "", "items": [], "new_versions": []}
     if not API_TOKEN:
         drafts["reason"] = "No API token provided, so unpublished drafts are not visible."
     else:
         drafts["enabled"] = True
         today = datetime.now(TZ).date()
+
+        def age_of(ts: str):
+            day = (ts or "")[:10]
+            return day, ((today - datetime.fromisoformat(day).date()).days if day else None)
+
         for u in units:
-            status, body = get("/api/search", params={"q": "*", "type": "dataset", "subtree": u["alias"],
-                                                      "fq": 'publicationStatus:"Draft"', "per_page": 1000},
-                               auth=True, allow_error=True)
-            if status != 200:
-                drafts["enabled"] = False
-                drafts["reason"] = f"The search API refused the draft query (HTTP {status})."
-                break
-            for d in body.get("data", {}).get("items", []):
-                # A published dataset with an unpublished new version is also "Draft"; keep only never-published ones.
-                if "Published" in (d.get("publicationStatuses") or []):
-                    continue
-                created = (d.get("createdAt") or "")[:10]
-                age = (today - datetime.fromisoformat(created).date()).days if created else None
-                drafts["items"].append({"unit": u["short"], "title": d.get("name", ""),
-                                        "pid": d.get("global_id", ""), "created": created, "age_days": age})
+            # Every dataset the PUBLIC search returned is published. The search index stores a
+            # separate "Draft" entry when a published dataset gets a new unpublished version,
+            # and that entry is NOT labelled "Published", so the label cannot be trusted here.
+            published_pids = set(u.get("pid_collection", {}))
+            seen = set()
+            start = 0
+            while True:
+                status, body = get("/api/search", params={"q": "*", "type": "dataset", "subtree": u["alias"],
+                                                          "fq": 'publicationStatus:"Draft"',
+                                                          "per_page": 1000, "start": start},
+                                   auth=True, allow_error=True)
+                if status != 200:
+                    drafts["enabled"] = False
+                    drafts["reason"] = f"The search API refused the draft query (HTTP {status})."
+                    return {"no_licence": no_licence, "drafts": drafts}
+                data = body.get("data", {})
+                items = data.get("items", [])
+                for d in items:
+                    pid = d.get("global_id", "")
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    if pid in published_pids:
+                        changed, age = age_of(d.get("updatedAt"))
+                        drafts["new_versions"].append({"unit": u["short"], "title": d.get("name", ""), "pid": pid,
+                                                       "changed": changed, "age_days": age})
+                    else:
+                        created, age = age_of(d.get("createdAt"))
+                        drafts["items"].append({"unit": u["short"], "title": d.get("name", ""), "pid": pid,
+                                                "created": created, "age_days": age})
+                start += len(items)
+                if not items or start >= data.get("total_count", 0):
+                    break
     return {"no_licence": no_licence, "drafts": drafts}
 
 
@@ -764,8 +787,20 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str) -> s
                                [[esc(i["unit"]), dataset_link(i["pid"], i["title"]), esc(i["created"]),
                                  fmt(i["age_days"]) if i["age_days"] is not None else ""] for i in d_items], {3})
                if d_items else '<p class="note">No unpublished drafts visible to this token.</p>')
-            + '<p class="note">Only drafts the token\'s account can see are included. Datasets that are published '
-              'but have an unpublished new version are excluded.</p>')
+            + '<p class="note">Only drafts the token\'s account can see are included.</p>')
+
+        nv = sorted(dr.get("new_versions", []), key=lambda x: -(x["age_days"] or 0))
+        write_csv("published_with_unpublished_changes.csv",
+                  ["Collection", "Title", "DOI", "Draft last changed", "Age (days)"],
+                  [[i["unit"], i["title"], i["pid"], i["changed"], i["age_days"]] for i in nv], ADMIN_DIR)
+        if nv:
+            drafts_html += (
+                f'<h3>Published datasets with unpublished changes ({fmt(len(nv))})</h3>'
+                '<p class="note">These are public, but someone has started a new version that has not been published. '
+                'Opening the link shows the published version unless you are logged in with edit rights.</p>'
+                + html_list_table(["Collection", "Dataset", "Draft last changed", "Age (days)"],
+                                  [[esc(i["unit"]), dataset_link(i["pid"], i["title"]), esc(i["changed"]),
+                                    fmt(i["age_days"]) if i["age_days"] is not None else ""] for i in nv], {3}))
     else:
         drafts_html = f'<p class="note">Not included in this run: {esc(dr["reason"])}</p>'
 
