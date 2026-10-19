@@ -1,0 +1,55 @@
+name: Access-request tracker
+
+# Takes a daily snapshot of the DataverseNL access-request queue and saves the history
+# in data/access_requests.json. The monthly report reads that file.
+# The daily commit also keeps the repository "active", so GitHub does not switch off
+# the scheduled workflows after 60 days.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"   # every day, 03:00 UTC (before the monthly report at 05:00 on the 1st)
+
+permissions:
+  contents: write   # needed to save data/access_requests.json back to the repository
+
+concurrency:
+  group: access-request-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Take snapshot of the queue
+        env:
+          DATAVERSE_API_TOKEN: ${{ secrets.DATAVERSE_API_TOKEN }}
+          # Secret key for the one-way codes that replace requester identities.
+          # Settings > Secrets and variables > Actions > New repository secret
+          # Name: REQUESTER_HASH_KEY   Value: a long random string. Never change it once set,
+          # or every waiting request will look new.
+          REQUESTER_HASH_KEY: ${{ secrets.REQUESTER_HASH_KEY }}
+        run: python request_tracker.py
+
+      - name: Save history to the repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/access_requests.json
+          if git diff --cached --quiet; then
+            echo "No changes to save."
+            exit 0
+          fi
+          git commit -m "Access-request tracker: $(date -u +%Y-%m-%d)"
+          git pull --rebase
+          git push

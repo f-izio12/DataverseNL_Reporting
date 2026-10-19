@@ -38,6 +38,7 @@ import html
 import json
 import mimetypes
 import os
+import statistics
 import sys
 import time
 from collections import defaultdict
@@ -575,7 +576,8 @@ def build_report(units: list[dict], access: dict, version: str, nav: str = "") -
     write_csv("downloads_per_year.csv", dl_headers, dl_rows)
 
     # ---- access requests: the public page only shows the proxy; details are on the admin page
-    access_html = (f'<p class="note">{fmt(restricted)} files ({pct(restricted, total_files)}) are restricted. '
+    access_html = request_history_html(ordered) + (
+                   f'<p class="note">{fmt(restricted)} files ({pct(restricted, total_files)}) are restricted. '
                    f'Only restricted files can receive an access request, so this is the upper bound of the '
                    f'access-request workload. Pending requests are listed on the admin page.</p>')
 
@@ -695,6 +697,84 @@ Sudden jumps (for example a collection rising from hundreds to hundreds of thous
 }})();
 </script>
 </body></html>"""
+
+
+def tracker_summary() -> dict | None:
+    """History collected by request_tracker.py (daily). None if tracking has not started."""
+    try:
+        import request_tracker as rt
+    except ImportError:
+        return None
+    state = rt.load_state()
+    if not state or not state.get("runs"):
+        return None
+    return rt.summarise(state, datetime.now(TZ).date().isoformat())
+
+
+def request_history_html(ordered: list[dict], admin: bool = False) -> str:
+    s = tracker_summary()
+    if s is None:
+        return ('<p class="note">Access-request history is not being tracked yet. Once the daily tracker runs, '
+                'this section shows requests per year per collection and the time to a decision.</p>')
+
+    units = [u["short"] for u in ordered]
+    units += sorted(set(s["by_unit_year"]) - set(units))
+    years = sorted({y for d in s["by_unit_year"].values() for y in d})
+    rows = []
+    tot = {y: {"new": 0, "decided": 0, "days": []} for y in years}
+    for un in units:
+        d = s["by_unit_year"].get(un, {})
+        if not d:
+            continue
+        row = [un]
+        for y in years:
+            c = d.get(y, {"new": 0, "decided": 0, "days": []})
+            med = statistics.median(c["days"]) if c["days"] else None
+            row += [c["new"], f"{med:g}" if med is not None else "–"]
+            for k in ("new", "decided"):
+                tot[y][k] += c[k]
+            tot[y]["days"] += c["days"]
+        rows.append(row)
+    total_row = ["Total"]
+    for y in years:
+        med = statistics.median(tot[y]["days"]) if tot[y]["days"] else None
+        total_row += [tot[y]["new"], f"{med:g}" if med is not None else "–"]
+    headers = ["Collection"] + [h for y in years for h in (f"{y} requests", f"{y} median days")]
+    write_csv("access_requests_per_year.csv", headers, rows + [total_row])
+
+    precision = ("to the nearest day" if s["max_gap"] <= 1
+                 else f"to within {s['max_gap']} days (the longest gap between two daily checks)")
+    med_all = ("not yet available" if s["median_days"] is None
+               else f"{s['median_days']:g} day" + ("" if s["median_days"] == 1 else "s"))
+    out = (
+        f'<p class="lead">Tracked daily since {esc(s["started"])} (last check {esc(s["last_run"])}). '
+        f'Median time from request to decision: <strong>{med_all}</strong>'
+        + (f'; {pct(s["within_14"], s["decided"])} decided within 14 days ({fmt(s["decided"])} decisions)'
+           if s["decided"] else "")
+        + f'. Currently waiting: {fmt(len(s["open"]))}.</p>'
+        + (table(headers, rows, total_row) if rows else '<p class="note">No new requests recorded yet.</p>')
+        + f'<p class="note">“Requests” counts requests by the day they first appeared; “median days” is the time until '
+          f'they left the queue, measured {precision}. A decision can be a grant or a rejection: the API does not say '
+          f'which. Requests made and decided between two daily checks are not seen, and nothing before '
+          f'{esc(s["started"])} is included.'
+        + (f' {fmt(s["baseline_open"])} requests were already waiting when tracking started; their start date is '
+           f'unknown, so they are left out of the figures.' if s["baseline_open"] else "")
+        + (f' {fmt(s["forbidden_files"])} restricted files cannot be checked with the current token, so these '
+           f'figures undercount.' if s["forbidden_files"] else "")
+        + '</p>')
+
+    if admin and s["open"]:
+        top = s["open"][:50]
+        out += ('<h3>Oldest waiting requests</h3>'
+                + html_list_table(["Collection", "Dataset", "Waiting (days)", ""],
+                                  [[esc(r["unit"]), dataset_link(r["dataset_pid"], r["dataset"]),
+                                    (f'{fmt(r["_waiting"])}+' if r["baseline"] else fmt(r["_waiting"])),
+                                    (f'<a href="{esc(BASE_URL)}/permissions-manage-files.xhtml?id={esc(r["dataset_id"])}" '
+                                     f'target="_blank" rel="noopener">Manage access</a>') if r.get("dataset_id") else ""]
+                                   for r in top], {2})
+                + '<p class="note">“+” means the request was already waiting when tracking started, so it has been '
+                  'waiting at least this long.</p>')
+    return out
 
 
 def dataset_link(pid: str, title: str) -> str:
@@ -876,6 +956,9 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str,
 <main>
 <div class="banner"><strong>For curators.</strong> Work lists for the RDM team: the access-request queue,
 unpublished drafts and datasets that need a licence.</div>
+
+<section><h2>Access requests over time</h2>
+{request_history_html(ordered, admin=True)}</section>
 
 <section><h2>Pending access requests</h2>
 {access_html}</section>
