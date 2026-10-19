@@ -6,12 +6,17 @@ on:
       include_access_requests:
         description: "Check pending access requests (needs DATAVERSE_API_TOKEN secret with curator rights)"
         type: boolean
-        default: false
+        default: true
   schedule:
     - cron: "0 5 1 * *"   # 1st of every month, 05:00 UTC
 
 permissions:
   contents: read
+
+# Never run two publications at the same time.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   report:
@@ -33,7 +38,10 @@ jobs:
           # Settings > Secrets and variables > Actions > New repository secret
           # Name: DATAVERSE_API_TOKEN
           DATAVERSE_API_TOKEN: ${{ secrets.DATAVERSE_API_TOKEN }}
-          INCLUDE_ACCESS_REQUESTS: ${{ inputs.include_access_requests && 'true' || 'false' }}
+          # Scheduled runs always check access requests, so the website stays complete.
+          INCLUDE_ACCESS_REQUESTS: ${{ (github.event_name == 'schedule' || inputs.include_access_requests) && 'true' || 'false' }}
+          # Titles of never-published drafts are left off the public website; set to "true" to show them.
+          PUBLISH_DRAFT_TITLES: "false"
           LOGO_PATH: assets/um-logo.png
         run: python dataverse_report.py
 
@@ -50,3 +58,22 @@ jobs:
           name: dataverse-ADMIN-${{ github.run_number }}
           path: output/admin/
           retention-days: 30
+
+      - name: Prepare website
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: output/site/
+
+  publish:
+    needs: report
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write      # to publish to GitHub Pages
+      id-token: write   # to prove the publication comes from this workflow
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

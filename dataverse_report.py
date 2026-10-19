@@ -6,7 +6,9 @@ Builds two self-contained HTML pages:
   output/admin/admin.html    internal page: pending access requests, unpublished
                              drafts and datasets without a licence, each with
                              links to the datasets, plus CSVs
-The GitHub workflow uploads them as two separate downloads.
+  output/site/               the website published by GitHub Pages:
+                             index.html (report) and admin.html, linked
+The GitHub workflow uploads the first two as downloads and publishes the site.
 
 Public data (no token needed):
   - new published datasets per month and year, per collection
@@ -54,6 +56,12 @@ ROOT_ALIAS = os.environ.get("ROOT_ALIAS", "maastricht")
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "output"))
 PUBLIC_DIR = OUTPUT_DIR / "public"   # report.html + CSVs, safe to share
 ADMIN_DIR = OUTPUT_DIR / "admin"     # admin.html, lists of datasets, access requests, drafts
+SITE_DIR = OUTPUT_DIR / "site"       # what GitHub Pages publishes: index.html (report) + admin.html
+
+# Titles of datasets that were never published are not public in DataverseNL.
+# By default the public website shows only counts and ages for them; the titles stay
+# in the downloadable admin artifact. Set to "true" to publish the titles on the website too.
+PUBLISH_DRAFT_TITLES = os.environ.get("PUBLISH_DRAFT_TITLES", "false").lower() == "true"
 
 # Monthly table: totals at or above this number get an extra marker.
 HIGHLIGHT_THRESHOLD = int(os.environ.get("HIGHLIGHT_THRESHOLD", "10"))
@@ -462,7 +470,15 @@ def write_csv(name: str, headers: list[str], rows: list[list], folder: Path | No
 # --------------------------------------------------------------------------
 # Report
 # --------------------------------------------------------------------------
-def build_report(units: list[dict], access: dict, version: str) -> str:
+def nav_bar(current: str) -> str:
+    """Links between the two pages; only used on the website."""
+    items = [("index.html", "Report"), ("admin.html", "Admin")]
+    links = "".join(
+        f'<a href="{href}"{" aria-current=page" if href == current else ""}>{label}</a>' for href, label in items)
+    return f'<nav class="pages">{links}</nav>'
+
+
+def build_report(units: list[dict], access: dict, version: str, nav: str = "") -> str:
     now = datetime.now(TZ)
     this_year = now.year
     active = [u for u in units if u["datasets"] > 0]
@@ -598,6 +614,7 @@ def build_report(units: list[dict], access: dict, version: str) -> str:
     <p class="meta">Generated {esc(generated)} · Source: {esc(BASE_URL)} (Dataverse {esc(version)}) · Collection “{esc(ROOT_ALIAS)}”</p>
   </div>
 </header>
+{nav}
 <main>
 <section class="kpis">{kpi_html}</section>
 
@@ -695,7 +712,9 @@ def html_list_table(headers: list[str], rows: list[list[str]], num_cols: set[int
     return f'<div class="tbl"><table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
-def build_admin(units: list[dict], access: dict, lists: dict, version: str) -> str:
+def build_admin(units: list[dict], access: dict, lists: dict, version: str,
+                nav: str = "", website: bool = False) -> str:
+    hide_draft_titles = website and not PUBLISH_DRAFT_TITLES
     now = datetime.now(TZ)
     ordered = [u for u in units if u["datasets"] > 0]
     ordered = [u for u in ordered if u["is_faculty"]] + [u for u in ordered if not u["is_faculty"]]
@@ -779,15 +798,30 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str) -> s
             per_unit[i["unit"]] += 1
         write_csv("unpublished_drafts.csv", ["Collection", "Title", "DOI", "Created", "Age (days)"],
                   [[i["unit"], i["title"], i["pid"], i["created"], i["age_days"]] for i in d_items], ADMIN_DIR)
-        drafts_html = (
-            table(["Collection", "Unpublished drafts"], [[u["short"], per_unit.get(u["short"], 0)] for u in ordered],
-                  ["Total", len(d_items)])
-            + "<h3>Drafts, oldest first</h3>"
-            + (html_list_table(["Collection", "Dataset", "Created", "Age (days)"],
-                               [[esc(i["unit"]), dataset_link(i["pid"], i["title"]), esc(i["created"]),
-                                 fmt(i["age_days"]) if i["age_days"] is not None else ""] for i in d_items], {3})
-               if d_items else '<p class="note">No unpublished drafts visible to this token.</p>')
-            + '<p class="note">Only drafts the token\'s account can see are included.</p>')
+        if hide_draft_titles:
+            bands = [("Under 3 months", 0, 91), ("3 to 12 months", 91, 366), ("1 to 2 years", 366, 731),
+                     ("Over 2 years", 731, 10 ** 6)]
+            band_rows = []
+            for u in ordered:
+                ages = [i["age_days"] or 0 for i in d_items if i["unit"] == u["short"]]
+                band_rows.append([u["short"]] + [sum(1 for a in ages if lo <= a < hi) for _, lo, hi in bands]
+                                 + [len(ages)])
+            band_total = ["Total"] + [sum(r[c] for r in band_rows) for c in range(1, len(bands) + 2)]
+            drafts_html = (
+                table(["Collection"] + [b[0] for b in bands] + ["Total"], band_rows, band_total)
+                + '<p class="note">Titles of datasets that were never published are not public in DataverseNL, '
+                  'so they are not listed on this website. The full list is in the downloadable admin report '
+                  '(<code>unpublished_drafts.csv</code>). Only drafts the token\'s account can see are included.</p>')
+        else:
+            drafts_html = (
+                table(["Collection", "Unpublished drafts"], [[u["short"], per_unit.get(u["short"], 0)] for u in ordered],
+                      ["Total", len(d_items)])
+                + "<h3>Drafts, oldest first</h3>"
+                + (html_list_table(["Collection", "Dataset", "Created", "Age (days)"],
+                                   [[esc(i["unit"]), dataset_link(i["pid"], i["title"]), esc(i["created"]),
+                                     fmt(i["age_days"]) if i["age_days"] is not None else ""] for i in d_items], {3})
+                   if d_items else '<p class="note">No unpublished drafts visible to this token.</p>')
+                + '<p class="note">Only drafts the token\'s account can see are included.</p>')
 
         nv = sorted(dr.get("new_versions", []), key=lambda x: -(x["age_days"] or 0))
         write_csv("published_with_unpublished_changes.csv",
@@ -833,14 +867,15 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str) -> s
 <header class="top">
   {logo_tag()}
   <div>
-    <p class="eyebrow">University Library · Research Data Management · Internal</p>
+    <p class="eyebrow">University Library · Research Data Management · Curation</p>
     <h1>DataverseNL admin page</h1>
     <p class="meta">Generated {esc(generated)} · Source: {esc(BASE_URL)} (Dataverse {esc(version)})</p>
   </div>
 </header>
+{nav}
 <main>
-<div class="banner"><strong>Internal use only.</strong> This page lists individual datasets, unpublished drafts and
-the access-request queue. Share the public report (<code>report.html</code>) instead of this page.</div>
+<div class="banner"><strong>For curators.</strong> Work lists for the RDM team: the access-request queue,
+unpublished drafts and datasets that need a licence.</div>
 
 <section><h2>Pending access requests</h2>
 {access_html}</section>
@@ -902,6 +937,10 @@ table.heat td.hit{box-shadow:inset 0 0 0 2px var(--accent);font-weight:700}
 .banner{background:rgba(var(--heat-rgb),.12);border:1px solid rgba(var(--heat-rgb),.5);border-radius:10px;padding:10px 14px;margin:16px 0;font-size:14px}
 a{color:var(--accent)}
 td.wrap{white-space:normal;min-width:260px}
+nav.pages{max-width:1100px;margin:0 auto;padding:10px 16px 0;display:flex;gap:6px}
+nav.pages a{padding:6px 14px;border-radius:999px;border:1px solid var(--line);text-decoration:none;
+  font-size:14px;font-weight:600;color:var(--muted);background:var(--card)}
+nav.pages a[aria-current]{color:var(--card);background:var(--accent);border-color:var(--accent)}
 details{margin-top:12px}
 summary{cursor:pointer;color:var(--accent);font-weight:600;font-size:14px;margin-bottom:8px}
 footer{max-width:1100px;margin:0 auto;padding:16px;color:var(--muted);font-size:12px;border-top:1px solid var(--line)}
@@ -912,6 +951,7 @@ footer{max-width:1100px;margin:0 auto;padding:16px;color:var(--muted);font-size:
 def main() -> int:
     PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
     ADMIN_DIR.mkdir(parents=True, exist_ok=True)
+    SITE_DIR.mkdir(parents=True, exist_ok=True)
     print(f"DataverseNL report for '{ROOT_ALIAS}' at {BASE_URL}")
     print("Token: " + ("provided" if API_TOKEN else "not provided") +
           f"; access requests: {'on' if INCLUDE_ACCESS_REQUESTS else 'off'}")
@@ -944,6 +984,12 @@ def main() -> int:
          "units": [{k: v for k, v in u.items() if k != "pid_collection"} for u in data]},
         indent=2, default=str), encoding="utf-8")
     (ADMIN_DIR / "admin.html").write_text(build_admin(data, access, lists, version), encoding="utf-8")
+
+    # Website for GitHub Pages: same pages, linked to each other.
+    (SITE_DIR / "index.html").write_text(
+        build_report(data, access, version, nav=nav_bar("index.html")), encoding="utf-8")
+    (SITE_DIR / "admin.html").write_text(
+        build_admin(data, access, lists, version, nav=nav_bar("admin.html"), website=True), encoding="utf-8")
     print(f"Done: {PUBLIC_DIR / 'report.html'} and {ADMIN_DIR / 'admin.html'}")
     return 0
 
