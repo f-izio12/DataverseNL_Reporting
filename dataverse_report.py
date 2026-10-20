@@ -145,7 +145,19 @@ def get(path: str, params: dict | None = None, auth: bool = False, allow_error: 
             except ValueError:
                 return r.status_code, {"message": r.text[:200]}
         r.raise_for_status()
-        return r.json()
+        try:
+            return r.json()
+        except ValueError:
+            # "OK" but not data: usually a maintenance page, a security check or an empty reply.
+            if not last:
+                print(f"  DataverseNL sent a non-data reply for {path}; retrying", flush=True)
+                time.sleep(min(60, 5 * 2 ** attempt))
+                continue
+            kind = r.headers.get("Content-Type", "unknown type")
+            preview = " ".join(r.text[:120].split()) or "(empty)"
+            raise SystemExit(
+                f"DataverseNL answered {path} with something that is not data ({kind}): {preview!r}. "
+                f"This is a problem on the DataverseNL side, not in the report; re-run the workflow later.")
     raise RuntimeError(f"Failed after retries: {url}")
 
 
@@ -320,9 +332,13 @@ def compare_with_draft(pid: str) -> dict:
     Uses /api/datasets/{id}/versions/:latest-published/compare/:draft (Dataverse 6.5+).
     Only WHERE something changed is kept (field names, counts), never the new values:
     the draft is unpublished and the admin page is public."""
-    status, body = get("/api/datasets/:persistentId/versions/:latest-published/compare/:draft",
-                       params={"persistentId": pid}, auth=True, allow_error=True)
-    if status != 200 or not isinstance(body.get("data"), dict):
+    try:
+        status, body = get("/api/datasets/:persistentId/versions/:latest-published/compare/:draft",
+                           params={"persistentId": pid}, auth=True, allow_error=True)
+    except Exception as exc:  # one failed comparison must never stop the whole report
+        print(f"  compare failed for {pid}: {type(exc).__name__}", flush=True)
+        return {"ok": False, "status": "error"}
+    if status != 200 or not isinstance(body, dict) or not isinstance(body.get("data"), dict):
         return {"ok": False, "status": status}
     d = body["data"]
     fields = []
@@ -350,7 +366,8 @@ def describe_changes(c: dict | None) -> str:
     if not c:
         return '<span class="muted">Not checked</span>'
     if not c["ok"]:
-        reason = "no permission to view the draft" if c["status"] in (401, 403) else f"HTTP {c['status']}"
+        reason = ("no permission to view the draft" if c["status"] in (401, 403)
+                  else "DataverseNL did not answer" if c["status"] == "error" else f"HTTP {c['status']}")
         return f'<span class="muted">Could not compare ({esc(reason)})</span>'
     parts = []
     if c["fields"]:
