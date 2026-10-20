@@ -222,20 +222,26 @@ def summarise(state: dict, today: str | None = None) -> dict:
     def days(a: str, b: str) -> int:
         return (date.fromisoformat(b) - date.fromisoformat(a)).days
 
+    runs = sorted(state["runs"])
+    # Waiting time is measured up to the last check, because that is when the request was last seen.
+    as_of = runs[-1] if runs else today_d.isoformat()
+
+    def cell(unit: str, year: int) -> dict:
+        return by_unit_year.setdefault(unit, {}).setdefault(
+            str(year), {"new": 0, "decided": 0, "days": []})
+
     by_unit_year: dict = {}
     for r in reqs:
         if r["baseline"]:
             continue
-        y = r["first_seen"][:4]
-        cell = by_unit_year.setdefault(r["unit"], {}).setdefault(y, {"new": 0, "decided": 0, "days": []})
-        cell["new"] += 1
+        start = date.fromisoformat(r["first_seen"])
+        cell(r["unit"], start.year)["new"] += 1
         if r["closed_reason"] == "decided":
-            cell["decided"] += 1
-            cell["days"].append(days(r["first_seen"], r["closed"]))
+            c = cell(r["unit"], start.year)
+            c["decided"] += 1
+            c["days"].append(days(r["first_seen"], r["closed"]))
 
-    runs = sorted(state["runs"])
-    # Waiting time is measured up to the last check, because that is when the request was last seen.
-    as_of = runs[-1] if runs else today_d.isoformat()
+
     open_reqs = [dict(r) for r in reqs if r["closed"] is None]
     for r in open_reqs:
         r["_waiting"] = days(r["first_seen"], as_of)

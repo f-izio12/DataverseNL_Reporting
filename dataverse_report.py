@@ -661,7 +661,7 @@ def build_report(units: list[dict], access: dict, version: str, nav: str = "") -
     write_csv("downloads_per_year.csv", dl_headers, dl_rows)
 
     # ---- access requests: the public page only shows the proxy; details are on the admin page
-    access_html = request_history_html(ordered) + (
+    access_html = request_year_table_html(units) + (
                    f'<p class="note">{fmt(restricted)} files ({pct(restricted, total_files)}) are restricted. '
                    f'Only restricted files can receive an access request, so this is the upper bound of the '
                    f'access-request workload. Pending requests are listed on the admin page.</p>')
@@ -796,70 +796,126 @@ def tracker_summary() -> dict | None:
     return rt.summarise(state, datetime.now(TZ).date().isoformat())
 
 
-def request_history_html(ordered: list[dict], admin: bool = False) -> str:
+REQUEST_YEARS_SHOWN = 5  # the year table keeps the last 5 calendar years; the oldest drops off
+
+
+def _fmt_date(iso: str) -> str:
+    d = datetime.fromisoformat(iso)
+    return f"{d.day} {d.strftime('%B %Y')}"
+
+
+def request_year_table_html(units: list[dict]) -> str:
+    """Requests per calendar year per collection, and average days from request to decision."""
     s = tracker_summary()
     if s is None:
-        return ('<p class="note">Access-request history is not being tracked yet. Once the daily tracker runs, '
-                'this section shows requests per year per collection and the time to a decision.</p>')
+        return ('<p class="note">Access requests are not being tracked yet. Once the daily tracker runs, this section '
+                'shows the number of requests per year per collection and the average time to a decision.</p>')
 
-    units = [u["short"] for u in ordered]
-    units += sorted(set(s["by_unit_year"]) - set(units))
-    years = sorted({y for d in s["by_unit_year"].values() for y in d})
-    rows = []
-    tot = {y: {"new": 0, "decided": 0, "days": []} for y in years}
-    for un in units:
-        d = s["by_unit_year"].get(un, {})
-        if not d:
-            continue
-        row = [un]
+    start_year = int(s["started"][:4])
+    this_year = datetime.now(TZ).year
+    years = [str(y) for y in range(max(start_year, this_year - REQUEST_YEARS_SHOWN + 1), this_year + 1)]
+
+    # Every top-level collection, faculties first, including those without requests
+    names = [u["short"] for u in units if u["is_faculty"]] + [u["short"] for u in units if not u["is_faculty"]]
+    names += sorted(set(s["by_unit_year"]) - set(names))
+
+    def median(days: list) -> str:
+        return f"{statistics.median(days):g}" if days else "–"
+
+    rows, tot = [], {y: {"new": 0, "days": []} for y in years}
+    for name in names:
+        row = [name]
         for y in years:
-            c = d.get(y, {"new": 0, "decided": 0, "days": []})
-            med = statistics.median(c["days"]) if c["days"] else None
-            row += [c["new"], f"{med:g}" if med is not None else "–"]
-            for k in ("new", "decided"):
-                tot[y][k] += c[k]
-            tot[y]["days"] += c["days"]
+            c = s["by_unit_year"].get(name, {}).get(y, {})
+            row += [c.get("new", 0), median(c.get("days", []))]
+            tot[y]["new"] += c.get("new", 0)
+            tot[y]["days"] += c.get("days", [])
         rows.append(row)
-    total_row = ["Total"]
-    for y in years:
-        med = statistics.median(tot[y]["days"]) if tot[y]["days"] else None
-        total_row += [tot[y]["new"], f"{med:g}" if med is not None else "–"]
-    headers = ["Collection"] + [h for y in years for h in (f"{y} requests", f"{y} median days")]
+    total_row = ["Total"] + [v for y in years for v in (tot[y]["new"], median(tot[y]["days"]))]
+    headers = ["Collection"] + [h for y in years for h in (f"{y} requests", f"{y} median days to decision")]
     write_csv("access_requests_per_year.csv", headers, rows + [total_row])
 
     precision = ("to the nearest day" if s["max_gap"] <= 1
-                 else f"to within {s['max_gap']} days (the longest gap between two daily checks)")
-    med_all = ("not yet available" if s["median_days"] is None
-               else f"{s['median_days']:g} day" + ("" if s["median_days"] == 1 else "s"))
-    out = (
-        f'<p class="lead">Tracked daily since {esc(s["started"])} (last check {esc(s["last_run"])}). '
-        f'Median time from request to decision: <strong>{med_all}</strong>'
-        + (f'; {pct(s["within_14"], s["decided"])} decided within 14 days ({fmt(s["decided"])} decisions)'
-           if s["decided"] else "")
-        + f'. Currently waiting: {fmt(len(s["open"]))}.</p>'
-        + (table(headers, rows, total_row) if rows else '<p class="note">No new requests recorded yet.</p>')
-        + f'<p class="note">“Requests” counts requests by the day they first appeared; “median days” is the time until '
-          f'they left the queue, measured {precision}. A decision can be a grant or a rejection: the API does not say '
-          f'which. Requests made and decided between two daily checks are not seen, and nothing before '
-          f'{esc(s["started"])} is included.'
-        + (f' {fmt(s["baseline_open"])} requests were already waiting when tracking started; their start date is '
-           f'unknown, so they are left out of the figures.' if s["baseline_open"] else "")
+                 else f"to within {s['max_gap']} days, the longest gap so far between two daily checks")
+    return (
+        f'<p class="lead">Access requests are measured from <strong>{_fmt_date(s["started"])}</strong>, when daily '
+        f'tracking started. Earlier requests are not included, so {start_year} is a partial year. Each new year adds '
+        f'two columns; the table keeps the last {REQUEST_YEARS_SHOWN} years. Last check: {_fmt_date(s["last_run"])}.</p>'
+        + table(headers, rows, total_row)
+        + '<p class="note"><strong>Requests</strong>: requests made in that year, counted on the day they first '
+          'appeared in the queue.</p>'
+          '<p class="note"><strong>Median days to decision</strong>: for the requests made in that year that have '
+          'been decided, the number of days from request to decision. The median is the middle value: half of the '
+          'requests were decided faster, half slower. Unlike the average, one exceptionally slow request does not '
+          'pull it up: ten requests decided in 2 days and one in 90 days give a median of 2 days (the average would '
+          'be 10). Each request counts in full in the year it was made, also when the decision falls in the next '
+          'year: a request made on 1 December and decided on 10 January counts as 40 days in the first year. '
+          'Requests still waiting are not included until they are decided, so the current year can still change.</p>'
+          '<p class="note">A decision is the moment a request leaves the queue, which can be a grant or a rejection: '
+          f'the API does not say which. Days are measured {precision}. Requests made and decided between two daily '
+          'checks are not seen.'
+        + ((' 1 request was' if s["baseline_open"] == 1 else f' {fmt(s["baseline_open"])} requests were')
+           + ' already waiting when tracking started; their start date is unknown, so they are not counted.'
+           if s["baseline_open"] else "")
         + (f' {fmt(s["forbidden_files"])} restricted files cannot be checked with the current token, so these '
            f'figures undercount.' if s["forbidden_files"] else "")
         + '</p>')
 
-    if admin and s["open"]:
-        top = s["open"][:50]
-        out += ('<h3>Oldest waiting requests</h3>'
-                + html_list_table(["Collection", "Dataset", "Waiting (days)", ""],
-                                  [[esc(r["unit"]), dataset_link(r["dataset_pid"], r["dataset"]),
-                                    (f'{fmt(r["_waiting"])}+' if r["baseline"] else fmt(r["_waiting"])),
-                                    (f'<a href="{esc(BASE_URL)}/permissions-manage-files.xhtml?id={esc(r["dataset_id"])}" '
-                                     f'target="_blank" rel="noopener">Manage access</a>') if r.get("dataset_id") else ""]
-                                   for r in top], {2})
-                + '<p class="note">“+” means the request was already waiting when tracking started, so it has been '
-                  'waiting at least this long.</p>')
-    return out
+
+def pending_requests_table(live_items: list | None) -> str:
+    """One table of everything waiting: live check for what is pending now, tracker for how long."""
+    s = tracker_summary()
+    waiting: dict = {}
+    if s:
+        for r in s["open"]:
+            w = waiting.setdefault(r["file_id"], {"days": -1, "baseline": False, "count": 0, "meta": r})
+            w["count"] += 1
+            if r["_waiting"] > w["days"]:
+                w["days"], w["baseline"] = r["_waiting"], r["baseline"]
+
+    rows = []
+    if live_items is not None:
+        for i in live_items:
+            w = waiting.get(str(i["file_id"]))
+            rows.append({"unit": i["unit"], "pid": i["dataset_pid"], "dataset": i["dataset"], "dataset_id": i["dataset_id"],
+                         "file": i["file"], "requesters": i["pending"],
+                         "days": w["days"] if w else None, "baseline": w["baseline"] if w else False})
+    else:
+        for fid, w in waiting.items():
+            m = w["meta"]
+            rows.append({"unit": m["unit"], "pid": m["dataset_pid"], "dataset": m["dataset"],
+                         "dataset_id": m.get("dataset_id", ""), "file": f"file {fid}", "requesters": w["count"],
+                         "days": w["days"], "baseline": w["baseline"]})
+    if not rows:
+        return '<p class="note">No pending requests found.</p>'
+    rows.sort(key=lambda r: (r["days"] is None, -(r["days"] or 0), r["unit"], r["dataset"]))
+
+    def waiting_cell(r) -> str:
+        if s is None:
+            return "–"
+        if r["days"] is None:
+            return "new today"
+        return f'{fmt(r["days"])}+' if r["baseline"] else fmt(r["days"])
+
+    def manage(r) -> str:
+        if not r["dataset_id"]:
+            return ""
+        return (f'<a href="{esc(BASE_URL)}/permissions-manage-files.xhtml?id={esc(r["dataset_id"])}" '
+                f'target="_blank" rel="noopener">Manage access</a>')
+
+    body = html_list_table(["Collection", "Dataset", "File", "Requesters", "Waiting (days)", "Manage access"],
+                           [[esc(r["unit"]), dataset_link(r["pid"], r["dataset"]), esc(r["file"]),
+                             fmt(r["requesters"]), waiting_cell(r), manage(r)] for r in rows], {3, 4})
+    note = ('<p class="note"><strong>Waiting</strong> counts from the day the daily tracker first saw the request; with '
+            'several requesters on one file it shows the longest. “+” means the request was already waiting when '
+            'tracking started, so it has been waiting at least that long. “New today” means it arrived after the '
+            'tracker\'s last check.' if s else
+            '<p class="note">Waiting times appear once the daily access-request tracker is running.')
+    if live_items is None and s:
+        note += f' This run did not check the queue itself; the list comes from the tracker\'s check of {_fmt_date(s["last_run"])}.'
+    note += (' Requesters\' names and e-mail addresses are deliberately not stored in this report; open '
+             '“Manage access” in DataverseNL to see who is asking.</p>')
+    return body + note
 
 
 def dataset_link(pid: str, title: str) -> str:
@@ -898,12 +954,6 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str,
         write_csv("access_requests_pending.csv", ["Collection", "Dataset", "DOI", "File", "File id", "Pending requests"],
                   [[i["unit"], i["dataset"], i["dataset_pid"], i["file"], i["file_id"], i["pending"]] for i in items],
                   ADMIN_DIR)
-        rows = []
-        for i in items:
-            manage = (f'<a href="{esc(BASE_URL)}/permissions-manage-files.xhtml?id={esc(i["dataset_id"])}" '
-                      f'target="_blank" rel="noopener">Manage access</a>') if i["dataset_id"] else ""
-            rows.append([esc(i["unit"]), dataset_link(i["dataset_pid"], i["dataset"]), esc(i["file"]),
-                         fmt(i["pending"]), manage])
         no_perm = sum(r[4] for r in a_rows)
 
         # ---- datasets the token cannot check, grouped by the collection where rights are granted
@@ -946,15 +996,12 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str,
             + (f'<p class="note warn">{fmt(no_perm)} restricted files could not be checked because the token\'s '
                f'account lacks curator rights on them, so these figures undercount. '
                f'They are listed further down.</p>' if no_perm else "")
-            + "<h3>Files with pending requests</h3>"
-            + (html_list_table(["Collection", "Dataset", "File", "Pending", ""], rows, {3}) if rows
-               else '<p class="note">No pending requests found.</p>')
-            + '<p class="note">Only <strong>pending</strong> requests are visible through the API: granted or rejected '
-              'requests are no longer listed. Requesters\' names and e-mail addresses are deliberately not stored in '
-              'this report; open “Manage access” in DataverseNL to see who is asking.</p>'
+            + "<h3>Waiting requests, longest first</h3>"
+            + pending_requests_table(items)
             + no_perm_html)
     else:
-        access_html = f'<p class="note">Not included in this run: {esc(access.get("reason", ""))}</p>'
+        access_html = (f'<p class="note">The queue was not checked in this run: {esc(access.get("reason", ""))}</p>'
+                       + (pending_requests_table(None) if tracker_summary() else ""))
 
     # ---- drafts
     dr = lists["drafts"]
@@ -1049,7 +1096,7 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str,
 unpublished drafts and datasets that need a licence.</div>
 
 <section><h2>Access requests over time</h2>
-{request_history_html(ordered, admin=True)}</section>
+{request_year_table_html(units)}</section>
 
 <section><h2>Pending access requests</h2>
 {access_html}</section>
