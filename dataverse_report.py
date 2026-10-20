@@ -315,6 +315,66 @@ def collect_access_requests(units: list[dict]) -> dict:
     return result
 
 
+def compare_with_draft(pid: str) -> dict:
+    """What differs between the published version and the draft of one dataset.
+    Uses /api/datasets/{id}/versions/:latest-published/compare/:draft (Dataverse 6.5+).
+    Only WHERE something changed is kept (field names, counts), never the new values:
+    the draft is unpublished and the admin page is public."""
+    status, body = get("/api/datasets/:persistentId/versions/:latest-published/compare/:draft",
+                       params={"persistentId": pid}, auth=True, allow_error=True)
+    if status != 200 or not isinstance(body.get("data"), dict):
+        return {"ok": False, "status": status}
+    d = body["data"]
+    fields = []
+    for block in d.get("metadataChanges") or []:
+        for ch in block.get("changed") or []:
+            name = ch.get("fieldName")
+            if name and name not in fields:
+                fields.append(name)
+    terms = [t.get("fieldName") for t in ((d.get("TermsOfAccess") or {}).get("changed") or []) if t.get("fieldName")]
+    return {
+        "ok": True,
+        "fields": fields,
+        "files_added": len(d.get("filesAdded") or []),
+        "files_removed": len(d.get("filesRemoved") or []),
+        "files_replaced": len(d.get("filesReplaced") or []),
+        "files_changed": len(d.get("fileChanges") or []),
+        "terms": terms,
+        "draft_version": (d.get("newVersion") or {}).get("versionNumber", ""),
+        "published_version": (d.get("oldVersion") or {}).get("versionNumber", ""),
+    }
+
+
+def describe_changes(c: dict | None) -> str:
+    """Short HTML note for curators: where to look, not what the new values are."""
+    if not c:
+        return '<span class="muted">Not checked</span>'
+    if not c["ok"]:
+        reason = "no permission to view the draft" if c["status"] in (401, 403) else f"HTTP {c['status']}"
+        return f'<span class="muted">Could not compare ({esc(reason)})</span>'
+    parts = []
+    if c["fields"]:
+        shown = c["fields"][:6]
+        more = len(c["fields"]) - len(shown)
+        parts.append(f'<strong>Metadata:</strong> {esc(", ".join(shown))}' + (f" and {more} more" if more else ""))
+    f_bits = []
+    if c["files_added"]:
+        f_bits.append(f'{c["files_added"]} added')
+    if c["files_removed"]:
+        f_bits.append(f'{c["files_removed"]} removed')
+    if c["files_replaced"]:
+        f_bits.append(f'{c["files_replaced"]} replaced')
+    if c["files_changed"]:
+        f_bits.append(f'{c["files_changed"]} with changed details')
+    if f_bits:
+        parts.append("<strong>Files:</strong> " + ", ".join(f_bits))
+    if c["terms"]:
+        parts.append(f'<strong>Terms of access:</strong> {esc(", ".join(c["terms"]))}')
+    if not parts:
+        return '<span class="muted">No differences: the draft is identical to the published version</span>'
+    return "<br>".join(parts)
+
+
 def collect_admin_lists(units: list[dict]) -> dict:
     """Lists for the admin page: datasets without a licence (public data) and
     unpublished drafts (only visible with a token that can see them)."""
@@ -374,6 +434,14 @@ def collect_admin_lists(units: list[dict]) -> dict:
                 start += len(items)
                 if not items or start >= data.get("total_count", 0):
                     break
+
+        # What changed in each draft of an already published dataset
+        if drafts["new_versions"]:
+            print(f"  comparing {len(drafts['new_versions'])} drafts with their published version", flush=True)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for item, cmp in zip(drafts["new_versions"],
+                                     pool.map(lambda i: compare_with_draft(i["pid"]), drafts["new_versions"])):
+                    item["changes"] = cmp
     return {"no_licence": no_licence, "drafts": drafts}
 
 
@@ -783,11 +851,13 @@ def dataset_link(pid: str, title: str) -> str:
     return f'<a href="{esc(BASE_URL)}/dataset.xhtml?persistentId={esc(pid)}" target="_blank" rel="noopener">{esc(title or pid)}</a>'
 
 
-def html_list_table(headers: list[str], rows: list[list[str]], num_cols: set[int] = frozenset()) -> str:
+def html_list_table(headers: list[str], rows: list[list[str]], num_cols: set[int] = frozenset(),
+                    wrap_cols: set[int] = frozenset({1})) -> str:
     """Table whose cells are already-escaped HTML (used for rows containing links)."""
     th = "".join(f'<th class="{"num" if i in num_cols else ""}">{esc(h)}</th>' for i, h in enumerate(headers))
     body = "".join("<tr>" + "".join(
-        f'<td class="{"num" if i in num_cols else ("wrap" if i == 1 else "")}">{c}</td>' for i, c in enumerate(r))
+        f'<td class="{"num" if i in num_cols else ("wrap" if i in wrap_cols else "")}">{c}</td>'
+        for i, c in enumerate(r))
         + "</tr>" for r in rows)
     return f'<div class="tbl"><table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>'
 
@@ -912,9 +982,13 @@ def build_admin(units: list[dict], access: dict, lists: dict, version: str,
                 f'<h3>Published datasets with unpublished changes ({fmt(len(nv))})</h3>'
                 '<p class="note">These are public, but someone has started a new version that has not been published. '
                 'Opening the link shows the published version unless you are logged in with edit rights.</p>'
-                + html_list_table(["Collection", "Dataset", "Draft last changed", "Age (days)"],
+                + html_list_table(["Collection", "Dataset", "Draft last changed", "Age (days)", "What changed"],
                                   [[esc(i["unit"]), dataset_link(i["pid"], i["title"]), esc(i["changed"]),
-                                    fmt(i["age_days"]) if i["age_days"] is not None else ""] for i in nv], {3}))
+                                    fmt(i["age_days"]) if i["age_days"] is not None else "",
+                                    describe_changes(i.get("changes"))] for i in nv], {3}, wrap_cols={1, 4})
+                + '<p class="note">“What changed” shows where the draft differs from the published version, not the '
+                  'new values, because the draft is not public. To see the details, open the dataset while logged in, '
+                  'go to the <em>Versions</em> tab, tick both versions and click <em>View Differences</em>.</p>')
     else:
         drafts_html = f'<p class="note">Not included in this run: {esc(dr["reason"])}</p>'
 
@@ -998,7 +1072,7 @@ h3{font-size:15px;margin:20px 0 8px}
 .chart{height:320px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
 .tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
 table{border-collapse:collapse;width:100%;font-size:13.5px}
-th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th,td{vertical-align:top;padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
 th{font-weight:600;color:var(--muted);background:var(--card);position:sticky;top:0}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 tfoot td{font-weight:650;border-top:2px solid var(--line)}
@@ -1019,7 +1093,8 @@ table.heat td.hit{box-shadow:inset 0 0 0 2px var(--accent);font-weight:700}
 .defs dd{margin:2px 0 0;color:var(--muted)}
 .banner{background:rgba(var(--heat-rgb),.12);border:1px solid rgba(var(--heat-rgb),.5);border-radius:10px;padding:10px 14px;margin:16px 0;font-size:14px}
 a{color:var(--accent)}
-td.wrap{white-space:normal;min-width:260px}
+td.wrap{white-space:normal;min-width:260px;vertical-align:top}
+.muted{color:var(--muted)}
 nav.pages{max-width:1100px;margin:0 auto;padding:10px 16px 0;display:flex;gap:6px}
 nav.pages a{padding:6px 14px;border-radius:999px;border:1px solid var(--line);text-decoration:none;
   font-size:14px;font-weight:600;color:var(--muted);background:var(--card)}
