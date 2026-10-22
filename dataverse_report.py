@@ -211,7 +211,7 @@ def monthly_increments(metric: str, alias: str) -> dict[str, int]:
     return out
 
 
-def count_subtree_collections(alias: str) -> dict[str, int]:
+def count_subtree_collections(alias: str) -> dict:
     tree = get("/api/info/metrics/tree", params={"parentAlias": alias})["data"]
     total = 0
 
@@ -222,7 +222,23 @@ def count_subtree_collections(alias: str) -> dict[str, int]:
             walk(c)
 
     walk(tree)
-    return {"subcollections": total}
+    # Direct sub-collections (departments, institutes, projects). Deeper levels are counted
+    # inside these, because the Metrics API always includes everything below a collection.
+    children = [{"alias": c["alias"], "name": (c.get("name") or c["alias"]).strip()}
+                for c in tree.get("children", []) or [] if c.get("alias")]
+    alias_to_child = {}
+
+    def mark(node, top):
+        for c in node.get("children", []) or []:
+            if c.get("alias"):
+                alias_to_child[c["alias"]] = top
+            mark(c, top)
+
+    for c in tree.get("children", []) or []:
+        if c.get("alias"):
+            alias_to_child[c["alias"]] = c["alias"]
+            mark(c, c["alias"])
+    return {"subcollections": total, "children": children, "alias_to_child": alias_to_child}
 
 
 def _count_years(dates) -> dict[str, int]:
@@ -247,6 +263,13 @@ def collect_unit(unit: dict) -> dict:
     by_type = get("/api/info/metrics/files/byType", params={"parentAlias": alias})["data"] if fl["total_count"] else []
     total_bytes = sum(int(t.get("size") or 0) for t in by_type)
 
+    sub = count_subtree_collections(alias)
+    # Downloads per direct sub-collection, for the expandable rows in the downloads annex
+    child_downloads = []
+    if ds["total_count"]:
+        for c in sub["children"]:
+            child_downloads.append({**c, "monthly": monthly_increments("downloads", c["alias"])})
+
     return {
         **unit,
         "datasets": ds["total_count"],
@@ -261,11 +284,95 @@ def collect_unit(unit: dict) -> dict:
         "bytes": total_bytes,
         "linked_to_publication": linked,
         "updated_after_v1": versions_gt1,
-        **count_subtree_collections(alias),
+        "subcollections": sub["subcollections"],
+        "child_downloads": child_downloads,
+        "alias_to_child": sub["alias_to_child"],
         # Which (sub-)collection each dataset sits in; used on the admin page only.
         "pid_collection": {d["global_id"]: [d.get("identifier_of_dataverse", ""), d.get("name_of_dataverse", "")]
                            for d in datasets if d.get("global_id")},
     }
+
+
+FILE_LOOKUP_LIMIT = 500  # files not in the current file list are looked up one by one, up to this many
+
+
+def collect_dataset_downloads(units: list[dict], years: list[int]) -> dict:
+    """Estimated dataset downloads per year: for each dataset, the downloads of its most-downloaded file.
+
+    DataverseNL records one download per FILE, so downloading a 100-file dataset counts 100 times.
+    Taking the highest single-file count per dataset counts that as 1, while 500 people downloading
+    one file still counts as 500."""
+    now = datetime.now(TZ)
+    print("  dataset downloads: listing files", flush=True)
+    file_to_ds = {str(f["file_id"]): f.get("dataset_persistent_id", "")
+                  for f in search_all({"q": "*", "type": "file", "subtree": ROOT_ALIAS}) if f.get("file_id")}
+
+    # Cumulative downloads per file at the end of each year (current year: up to this month)
+    cum = {}
+    for y in [years[0] - 1] + years:
+        month = f"{y}-12" if y < now.year else now.strftime("%Y-%m")
+        rows = get(f"/api/info/metrics/filedownloads/toMonth/{month}", params={"parentAlias": ROOT_ALIAS})["data"]
+        cum[y] = {str(r["id"]): int(r.get("count") or 0) for r in rows if r.get("id") is not None}
+    per_file = {}
+    for y in years:
+        for fid, c in cum[y].items():
+            d = c - cum[y - 1].get(fid, 0)
+            if d > 0:
+                per_file.setdefault(fid, {})[y] = d
+
+    # Files with downloads that are not in the current file list (replaced, removed): look up their dataset
+    missing = sorted((f for f in per_file if f not in file_to_ds), key=lambda f: -sum(per_file[f].values()))
+    looked_up = 0
+    for fid in missing[:FILE_LOOKUP_LIMIT]:
+        status, body = get(f"/api/files/{fid}", params={"returnOwners": "true"}, allow_error=True)
+        node = (body.get("data") or {}).get("isPartOf") if status == 200 and isinstance(body, dict) else None
+        while isinstance(node, dict):
+            if node.get("type") == "DATASET" and node.get("persistentIdentifier"):
+                file_to_ds[fid] = node["persistentIdentifier"]
+                looked_up += 1
+                break
+            node = node.get("isPartOf")
+    print(f"  dataset downloads: {len(per_file)} files with downloads, {len(missing)} not in the file list, "
+          f"{looked_up} of those linked", flush=True)
+
+    # Highest single-file count per dataset and year
+    per_ds: dict = {}
+    unlinked = {y: 0 for y in years}     # file downloads that could not be linked to a dataset
+    unplaced = {y: 0 for y in years}     # estimated downloads of datasets no longer in a UM collection
+    total_files = {y: 0 for y in years}
+    for fid, ys in per_file.items():
+        pid = file_to_ds.get(fid)
+        for y, d in ys.items():
+            total_files[y] += d
+            if not pid:
+                unlinked[y] += d
+                continue
+            cur = per_ds.setdefault(pid, {})
+            cur[y] = max(cur.get(y, 0), d)
+
+    # Roll datasets up to collection and sub-collection
+    where = {}
+    for u in units:
+        for pid, (coll_alias, _name) in u.get("pid_collection", {}).items():
+            where[pid] = (u["alias"], u.get("alias_to_child", {}).get(coll_alias))
+    unit_years, child_years, direct_years = {}, {}, {}
+    for pid, ys in per_ds.items():
+        if pid not in where:
+            for y, n in ys.items():   # e.g. deaccessioned datasets: no longer in any collection
+                unplaced[y] += n
+            continue
+        ua, child = where[pid]
+        for y, n in ys.items():
+            unit_years.setdefault(ua, {}).setdefault(y, 0)
+            unit_years[ua][y] += n
+            if child:
+                child_years.setdefault(ua, {}).setdefault(child, {}).setdefault(y, 0)
+                child_years[ua][child][y] += n
+            else:
+                direct_years.setdefault(ua, {}).setdefault(y, 0)
+                direct_years[ua][y] += n
+    return {"unit": unit_years, "child": child_years, "direct": direct_years,
+            "unlinked": unlinked, "unplaced": unplaced, "file_downloads": total_files}
 
 
 def collect_access_requests(units: list[dict]) -> dict:
@@ -659,6 +766,7 @@ def build_report(units: list[dict], access: dict, version: str, nav: str = "") -
     dl_headers = ["Collection"] + [str(yy) for yy in dl_years]
     dl_rows = [[u["short"]] + [year_sum(u["downloads_monthly"], yy) for yy in dl_years] for u in ordered]
     write_csv("downloads_per_year.csv", dl_headers, dl_rows)
+    downloads_html = downloads_annex_html(ordered, dl_years, year_sum)
 
     # ---- access requests: the public page only shows the proxy; details are on the admin page
     access_html = request_year_table_html(units) + (
@@ -757,10 +865,10 @@ per project instead of depositing in the department collection.</dd>
 <li>Views and citations are not reported: Make Data Count statistics are not available for these datasets on DataverseNL.</li>
 </ul></section>
 
-<section class="annex"><h2>Annex: downloads per year</h2>
-<p class="note warn">Use with care. Download counts include automated traffic and many-file datasets.
-Sudden jumps (for example a collection rising from hundreds to hundreds of thousands in one year) are not evidence of real reuse.</p>
-{table(dl_headers, dl_rows)}</section>
+<section class="annex"><h2>Annex: dataset downloads per year</h2>
+<p class="note warn">Use with care. Download figures include automated traffic. Sudden jumps (for example a collection
+rising from hundreds to hundreds of thousands in one year) are not evidence of real reuse.</p>
+{downloads_html}</section>
 </main>
 <footer>Data: DataverseNL public API, plus authenticated calls where stated. Report script maintained by the University Library.</footer>
 <script>
@@ -782,6 +890,141 @@ Sudden jumps (for example a collection rising from hundreds to hundreds of thous
 }})();
 </script>
 </body></html>"""
+
+
+JUMP_FACTOR = 10     # a year with at least 10x the previous year's downloads is flagged ...
+JUMP_MINIMUM = 1000  # ... if it has at least this many downloads
+
+
+def downloads_annex_html(ordered: list[dict], years: list[int], year_sum) -> str:
+    """Downloads per year per collection; each collection opens to show its sub-collections."""
+
+    def cells(values: list[int]) -> str:
+        out = ""
+        for i, v in enumerate(values):
+            prev = values[i - 1] if i else None
+            jump = prev is not None and v >= JUMP_MINIMUM and v >= JUMP_FACTOR * max(prev, 1)
+            mark = (f' <span class="jump" title="At least {JUMP_FACTOR} times the year before: check for automated '
+                    f'downloads before using this figure">▲</span>') if jump else ""
+            out += f'<td class="num">{fmt(v)}{mark}</td>'
+        return out
+
+    est = ordered[0].get("_dl_estimates") if ordered else None
+    use_est = est is not None
+    csv_rows, body = [], ""
+    hidden_total = 0
+    for n, u in enumerate(ordered):
+        files_parent = [year_sum(u["downloads_monthly"], y) for y in years]
+        files_kids = {c["alias"]: [year_sum(c["monthly"], y) for y in years] for c in u.get("child_downloads", [])}
+        if use_est:
+            parent = [est["unit"].get(u["alias"], {}).get(y, 0) for y in years]
+            kid_vals = {a: [est["child"].get(u["alias"], {}).get(a, {}).get(y, 0) for y in years]
+                        for a in files_kids}
+            direct = [est["direct"].get(u["alias"], {}).get(y, 0) for y in years]
+        else:
+            parent = files_parent
+            kid_vals = files_kids
+            direct = None
+        kids = []
+        for c in u.get("child_downloads", []):
+            vals = kid_vals[c["alias"]]
+            if any(vals):
+                kids.append((c["name"], c["alias"], vals))
+            else:
+                hidden_total += 1
+            csv_rows.append([u["short"], c["name"], "dataset downloads (estimate)" if use_est else "file downloads"] + vals)
+            if use_est:
+                csv_rows.append([u["short"], c["name"], "file downloads"] + files_kids[c["alias"]])
+        kids.sort(key=lambda k: -sum(k[2]))
+        if direct is None:
+            direct = [max(0, p - sum(k[2][i] for k in kids)) for i, p in enumerate(parent)]
+        if kids and any(direct):
+            kids.append((f"Directly in {u['short']}", "", direct))
+        csv_rows.append([u["short"], "(total)", "dataset downloads (estimate)" if use_est else "file downloads"] + parent)
+        if use_est:
+            csv_rows.append([u["short"], "(total)", "file downloads"] + files_parent)
+        gid = f"dl{n}"
+        if kids:
+            name = (f'<button type="button" class="expand" aria-expanded="false" aria-controls="{gid}" '
+                    f'data-group="{gid}"><span class="chev" aria-hidden="true">▸</span>{esc(u["short"])}'
+                    f'<span class="count">{len(kids)}</span></button>')
+        else:
+            name = f'<span class="noexpand">{esc(u["short"])}</span>'
+        body += f'<tbody class="grp"><tr class="parent"><td>{name}</td>{cells(parent)}</tr></tbody>'
+        if kids:
+            body += f'<tbody id="{gid}" class="kids" hidden>'
+            for kname, kalias, vals in kids:
+                label = (f'<a href="{esc(BASE_URL)}/dataverse/{esc(kalias)}" target="_blank" rel="noopener">{esc(kname)}</a>'
+                         if kalias else f'<span class="muted">{esc(kname)}</span>')
+                body += f'<tr class="child"><td class="wrap">{label}</td>{cells(vals)}</tr>'
+            body += "</tbody>"
+    write_csv("downloads_by_subcollection.csv", ["Collection", "Sub-collection", "Measure"] + [str(y) for y in years],
+              csv_rows)
+
+    if use_est:
+        tot_files = sum(est["file_downloads"].get(y, 0) for y in years)
+        tot_unlinked = sum(est["unlinked"].get(y, 0) for y in years)
+        tot_unplaced = sum(est["unplaced"].get(y, 0) for y in years)
+        method = (
+            '<div class="method"><h3>How “dataset downloads” are estimated</h3>'
+            '<p>DataverseNL counts a download for every <em>file</em>. Someone who downloads a dataset with 100 files '
+            'adds 100 downloads, so large datasets look far more used than they are. This table therefore counts '
+            '<strong>datasets</strong>: for each dataset and year it takes the download count of its '
+            '<strong>most-downloaded file</strong>. Downloading all 100 files once counts as 1; 500 people downloading '
+            'one file counts as 500.</p>'
+            '<p><strong>Caveats.</strong></p><ul>'
+            '<li><strong>It is an estimate, and on the low side.</strong> When different people download different '
+            'single files of the same dataset in the same year, they are counted as one: if A downloads file 1 and '
+            'B downloads file 2, the estimate is 1, not 2.</li>'
+            '<li><strong>Automated traffic is still included.</strong> It is reduced only where a program downloads '
+            'many files of one dataset. A program that downloads the same file repeatedly still counts every time.</li>'
+            '<li><strong>Repeat downloads count.</strong> The same person downloading a file twice counts as 2: '
+            'anonymous downloads cannot be told apart.</li>'
+            + (f'<li><strong>Not every download can be linked to a dataset.</strong> Files that are no longer in a '
+               f'dataset (removed or replaced) cannot always be traced: {pct(tot_unlinked, tot_files)} of file '
+               f'downloads in these years ({fmt(tot_unlinked)} of {fmt(tot_files)}) are left out.</li>'
+               if tot_unlinked else '')
+            + (f'<li>{fmt(tot_unplaced)} estimated downloads belong to datasets that are no longer in a UM collection '
+               f'(for example withdrawn datasets) and are not in the table.</li>' if tot_unplaced else '')
+            + '</ul><p>The original file-download counts are kept in <code>downloads_by_subcollection.csv</code> '
+              'for comparison.</p></div>')
+    else:
+        method = ('<p class="note warn">The dataset-level estimate could not be calculated in this run, so this table '
+                  'shows <strong>file downloads</strong>: a dataset with 100 files downloaded once counts as 100.</p>')
+
+    head = "".join(f'<th class="num">{y}</th>' for y in years)
+    return (method + 
+        '<p class="lead">Click a collection to see its sub-collections (departments, institutes and projects). '
+        'Deeper levels are included in the sub-collection above them. “Directly in …” counts datasets deposited '
+        'in the collection itself rather than in a sub-collection.'
+        + (f' {fmt(hidden_total)} sub-collection{"s" if hidden_total != 1 else ""} without any downloads in these '
+           f'years {"are" if hidden_total != 1 else "is"} not listed.' if hidden_total else '')
+        + '</p>'
+        '<p><button type="button" class="expand-all" data-state="closed">Show all sub-collections</button></p>'
+        f'<div class="tbl"><table class="dl"><thead><tr><th>Collection</th>{head}</tr></thead>{body}</table></div>'
+        f'<p class="note"><span class="jump">▲</span> marks a year with at least {JUMP_FACTOR} times the downloads '
+        f'of the year before (and at least {fmt(JUMP_MINIMUM)}). These are usually automated downloads or a dataset '
+        'with many files, not a real rise in reuse.</p>'
+        """<script>
+(function(){
+  function setGroup(btn, open){
+    var g = document.getElementById(btn.dataset.group);
+    if (!g) return;
+    g.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  document.querySelectorAll('table.dl button.expand').forEach(function(b){
+    b.addEventListener('click', function(){ setGroup(b, b.getAttribute('aria-expanded') !== 'true'); });
+  });
+  var all = document.querySelector('button.expand-all');
+  if (all) all.addEventListener('click', function(){
+    var open = all.dataset.state !== 'open';
+    document.querySelectorAll('table.dl button.expand').forEach(function(b){ setGroup(b, open); });
+    all.dataset.state = open ? 'open' : 'closed';
+    all.textContent = open ? 'Hide all sub-collections' : 'Show all sub-collections';
+  });
+})();
+</script>""")
 
 
 def tracker_summary() -> dict | None:
@@ -1158,7 +1401,22 @@ table.heat td.hit{box-shadow:inset 0 0 0 2px var(--accent);font-weight:700}
 .banner{background:rgba(var(--heat-rgb),.12);border:1px solid rgba(var(--heat-rgb),.5);border-radius:10px;padding:10px 14px;margin:16px 0;font-size:14px}
 a{color:var(--accent)}
 td.wrap{white-space:normal;min-width:260px;vertical-align:top}
+.method{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:4px 16px 8px;margin:12px 0;font-size:14px}
+.method h3{margin-top:12px}
+.method ul{padding-left:20px}
+.method li{margin:4px 0}
 .muted{color:var(--muted)}
+table.dl button.expand{all:unset;cursor:pointer;font-weight:600;color:var(--accent);display:inline-flex;align-items:center;gap:6px}
+table.dl button.expand:focus-visible,button.expand-all:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+table.dl .chev{display:inline-block;transition:transform .15s;width:10px}
+table.dl button[aria-expanded="true"] .chev{transform:rotate(90deg)}
+table.dl .count{font-size:11px;font-weight:600;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:0 6px}
+table.dl .noexpand{padding-left:16px;font-weight:600}
+table.dl tr.child td{background:var(--bg);font-size:13px}
+table.dl tr.child td:first-child{padding-left:32px}
+.jump{color:var(--warn);font-size:11px;cursor:help}
+button.expand-all{font:inherit;font-size:13px;padding:5px 12px;border-radius:999px;border:1px solid var(--line);
+  background:var(--card);color:var(--accent);cursor:pointer}
 nav.pages{max-width:1100px;margin:0 auto;padding:10px 16px 0;display:flex;gap:6px}
 nav.pages a{padding:6px 14px;border-radius:999px;border:1px solid var(--line);text-decoration:none;
   font-size:14px;font-weight:600;color:var(--muted);background:var(--card)}
@@ -1183,6 +1441,16 @@ def main() -> int:
     print(f"Found {len(units)} top-level collections. Collecting:")
     data = [collect_unit(u) for u in units]
 
+    this_year = datetime.now(TZ).year
+    dl_years = list(range(this_year - 5, this_year + 1))
+    try:
+        estimates = collect_dataset_downloads(data, dl_years)
+    except Exception as exc:  # the report must not fail because of this estimate
+        print(f"  dataset downloads could not be estimated ({type(exc).__name__}); showing file downloads instead")
+        estimates = None
+    for u in data:
+        u["_dl_estimates"] = estimates
+
     print("Access requests:")
     access = collect_access_requests([u for u in data if u["datasets"] > 0])
     if not access.get("enabled"):
@@ -1203,7 +1471,8 @@ def main() -> int:
     (PUBLIC_DIR / "report.html").write_text(build_report(data, access, version), encoding="utf-8")
     (PUBLIC_DIR / "raw_data.json").write_text(json.dumps(
         {"generated": datetime.now(TZ).isoformat(), "version": version,
-         "units": [{k: v for k, v in u.items() if k != "pid_collection"} for u in data]},
+         "units": [{k: v for k, v in u.items() if k not in ("pid_collection", "alias_to_child", "_dl_estimates")}
+                   for u in data]},
         indent=2, default=str), encoding="utf-8")
     (ADMIN_DIR / "admin.html").write_text(build_admin(data, access, lists, version), encoding="utf-8")
 
