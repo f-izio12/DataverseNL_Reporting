@@ -118,11 +118,11 @@ SESSION.headers.update({"Accept": "application/json", "User-Agent": "UM-Library-
 # --------------------------------------------------------------------------
 # HTTP helpers
 # --------------------------------------------------------------------------
-def get(path: str, params: dict | None = None, auth: bool = False, allow_error: bool = False):
-    """GET a Dataverse API path and return the parsed JSON body."""
+def get(path: str, params: dict | None = None, auth: bool = False, allow_error: bool = False, attempts: int = 6):
+    """GET a Dataverse API path and return the parsed JSON body.
+    attempts=6 waits 5, 10, 20, 40, 60 s between tries: rides out a short DataverseNL hiccup."""
     headers = {"X-Dataverse-key": API_TOKEN} if auth and API_TOKEN else {}
     url = f"{BASE_URL}{path}"
-    attempts = 6  # waits 5, 10, 20, 40, 60 s: rides out a short DataverseNL hiccup
     for attempt in range(attempts):
         last = attempt == attempts - 1
         try:
@@ -201,9 +201,9 @@ def get_units() -> list[dict]:
     return units
 
 
-def monthly_increments(metric: str, alias: str) -> dict[str, int]:
+def monthly_increments(metric: str, alias: str, attempts: int = 6) -> dict[str, int]:
     """Metrics API monthly series are cumulative; convert to per-month counts."""
-    data = get(f"/api/info/metrics/{metric}/monthly", params={"parentAlias": alias})["data"]
+    data = get(f"/api/info/metrics/{metric}/monthly", params={"parentAlias": alias}, attempts=attempts)["data"]
     out, prev = {}, 0
     for row in sorted(data, key=lambda r: r["date"]):
         out[row["date"]] = row["count"] - prev
@@ -268,7 +268,15 @@ def collect_unit(unit: dict) -> dict:
     child_downloads = []
     if ds["total_count"]:
         for c in sub["children"]:
-            child_downloads.append({**c, "monthly": monthly_increments("downloads", c["alias"])})
+            # Not essential (file downloads per sub-collection are only used for the CSV and as a fallback),
+            # so a sub-collection DataverseNL cannot answer for is skipped instead of stopping the report.
+            try:
+                monthly = monthly_increments("downloads", c["alias"], attempts=2)
+            except Exception as exc:
+                print(f"    file downloads for sub-collection {c['alias']} unavailable ({type(exc).__name__}); skipped",
+                      flush=True)
+                monthly = None
+            child_downloads.append({**c, "monthly": monthly})
 
     return {
         **unit,
@@ -913,9 +921,12 @@ def downloads_annex_html(ordered: list[dict], years: list[int], year_sum) -> str
     use_est = est is not None
     csv_rows, body = [], ""
     hidden_total = 0
+    unavailable: list[str] = []
     for n, u in enumerate(ordered):
         files_parent = [year_sum(u["downloads_monthly"], y) for y in years]
-        files_kids = {c["alias"]: [year_sum(c["monthly"], y) for y in years] for c in u.get("child_downloads", [])}
+        files_kids = {c["alias"]: ([year_sum(c["monthly"], y) for y in years] if c["monthly"] is not None else None)
+                      for c in u.get("child_downloads", [])}
+        unavailable += [c["name"] for c in u.get("child_downloads", []) if c["monthly"] is None]
         if use_est:
             parent = [est["unit"].get(u["alias"], {}).get(y, 0) for y in years]
             kid_vals = {a: [est["child"].get(u["alias"], {}).get(a, {}).get(y, 0) for y in years]
@@ -928,13 +939,16 @@ def downloads_annex_html(ordered: list[dict], years: list[int], year_sum) -> str
         kids = []
         for c in u.get("child_downloads", []):
             vals = kid_vals[c["alias"]]
+            if vals is None:            # only possible without the estimate: file downloads unavailable
+                continue
             if any(vals):
                 kids.append((c["name"], c["alias"], vals))
             else:
                 hidden_total += 1
             csv_rows.append([u["short"], c["name"], "dataset downloads (estimate)" if use_est else "file downloads"] + vals)
             if use_est:
-                csv_rows.append([u["short"], c["name"], "file downloads"] + files_kids[c["alias"]])
+                fk = files_kids[c["alias"]]
+                csv_rows.append([u["short"], c["name"], "file downloads"] + (fk if fk is not None else ["unavailable"] * len(years)))
         kids.sort(key=lambda k: -sum(k[2]))
         if direct is None:
             direct = [max(0, p - sum(k[2][i] for k in kids)) for i, p in enumerate(parent)]
@@ -999,6 +1013,10 @@ def downloads_annex_html(ordered: list[dict], years: list[int], year_sum) -> str
         'in the collection itself rather than in a sub-collection.'
         + (f' {fmt(hidden_total)} sub-collection{"s" if hidden_total != 1 else ""} without any downloads in these '
            f'years {"are" if hidden_total != 1 else "is"} not listed.' if hidden_total else '')
+        + ((' DataverseNL could not provide file-download figures for: ' + esc(", ".join(unavailable))
+            + ('. They are not listed below.' if not use_est else
+               '. Their dataset downloads are still included; only the file-download comparison in the CSV is missing.'))
+           if unavailable else '')
         + '</p>'
         '<p><button type="button" class="expand-all" data-state="closed">Show all sub-collections</button></p>'
         f'<div class="tbl"><table class="dl"><thead><tr><th>Collection</th>{head}</tr></thead>{body}</table></div>'
