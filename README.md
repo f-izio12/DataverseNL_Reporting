@@ -71,6 +71,11 @@ Set in the workflow files (`env:`) or at the top of `dataverse_report.py`.
 - Collections that are not faculties (UNU-MERIT, DataHub, MUMC+ and others) are shown separately
   rather than left out.
 - **Views and citations** are not available for these datasets on DataverseNL.
+- **Storage used** comes from DataverseNL's storage-size function (`/api/dataverses/{alias}/storagesize`,
+  needs the API token): files in published and unpublished datasets, each file counted once. This is
+  the same figure as DANS's storage exports. Units are decimal (1 GB = 1,000,000,000 bytes). The
+  Metrics API's "files by type" is not used for storage: it counts a file once for every published
+  version it appears in.
 
 ### Dataset downloads
 

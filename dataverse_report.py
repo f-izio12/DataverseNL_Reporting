@@ -38,6 +38,7 @@ import html
 import json
 import mimetypes
 import os
+import re
 import statistics
 import sys
 import time
@@ -241,6 +242,27 @@ def count_subtree_collections(alias: str) -> dict:
     return {"subcollections": total, "children": children, "alias_to_child": alias_to_child}
 
 
+STORAGE_TOTAL: int | None = None  # storage of the whole UM collection, set in main()
+
+
+def storage_size(alias: str) -> int | None:
+    """Space used by a collection and everything below it, in bytes: files in published AND
+    unpublished datasets, each file counted once (DataverseNL's own storage-size function, the
+    same figure as DANS's storage exports). Needs the API token; None if not available."""
+    if not API_TOKEN:
+        return None
+    status, body = get(f"/api/dataverses/{alias}/storagesize", auth=True, allow_error=True, attempts=3)
+    if status != 200 or not isinstance(body, dict):
+        return None
+    msg = str((body.get("data") or {}).get("message", ""))
+    # "Total size of the files stored in this dataverse: 1,067,873,738 bytes"
+    m = re.search(r":\s*([0-9][0-9.,\s\u00a0\u202f']*)\s*bytes", msg)
+    if not m:
+        return None
+    digits = re.sub(r"\D", "", m.group(1))
+    return int(digits) if digits else None
+
+
 def _count_years(dates) -> dict[str, int]:
     out: dict[str, int] = defaultdict(int)
     for d in dates:
@@ -261,7 +283,9 @@ def collect_unit(unit: dict) -> dict:
     versions_gt1 = sum(1 for d in datasets if (d.get("majorVersion") or 1) > 1 or (d.get("minorVersion") or 0) > 0)
 
     by_type = get("/api/info/metrics/files/byType", params={"parentAlias": alias})["data"] if fl["total_count"] else []
-    total_bytes = sum(int(t.get("size") or 0) for t in by_type)
+    # Sum of file sizes per published VERSION (Metrics API): a file in three published versions counts
+    # three times, so this is NOT used for storage. Kept only for reference in raw_data.json.
+    released_version_bytes = sum(int(t.get("size") or 0) for t in by_type)
 
     sub = count_subtree_collections(alias)
     # Downloads per direct sub-collection, for the expandable rows in the downloads annex
@@ -289,7 +313,8 @@ def collect_unit(unit: dict) -> dict:
         "licences": facet_counts(ds, "license"),
         "file_access": facet_counts(fl, "fileAccess"),
         "file_groups": facet_counts(fl, "fileTypeGroupFacet"),
-        "bytes": total_bytes,
+        "released_version_bytes": released_version_bytes,
+        "storage_bytes": storage_size(alias),
         "linked_to_publication": linked,
         "updated_after_v1": versions_gt1,
         "subcollections": sub["subcollections"],
@@ -588,11 +613,16 @@ def fmt(n) -> str:
     return f"{n:,}".replace(",", " ") if isinstance(n, int) else esc(n)
 
 
-def fmt_bytes(n: int) -> str:
+def fmt_bytes(n: int | None) -> str:
+    """Decimal units, as in storage exports and invoices: 1 GB = 1,000,000,000 bytes."""
+    if n is None:
+        return "unavailable"
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
-        n /= 1024
+        if n < 1000 or unit == "TB":
+            if unit == "B":
+                return f"{n} B"
+            return f"{n:.2f} {unit}" if unit == "TB" else f"{n:.1f} {unit}"
+        n /= 1000
     return str(n)
 
 
@@ -695,7 +725,10 @@ def build_report(units: list[dict], access: dict, version: str, nav: str = "") -
 
     total_ds = sum(u["datasets"] for u in active)
     total_files = sum(u["files"] for u in active)
-    total_bytes = sum(u["bytes"] for u in active)
+    missing_storage = [u["short"] for u in units if u.get("storage_bytes") is None]
+    total_bytes = (STORAGE_TOTAL if STORAGE_TOTAL is not None
+                   else (sum(u["storage_bytes"] for u in units if u.get("storage_bytes") is not None)
+                         if len(missing_storage) < len(units) else None))
     restricted = sum(u["file_access"].get("Restricted", 0) for u in active)
     pub_this_year = sum(year_sum(u["published_monthly"], this_year) for u in active)
     pub_last_year = sum(year_sum(u["published_monthly"], this_year - 1) for u in active)
@@ -750,15 +783,15 @@ def build_report(units: list[dict], access: dict, version: str, nav: str = "") -
     write_csv("licences.csv", l_headers, l_rows + [l_total])
 
     # ---- storage, linkage, structure
-    s_headers = ["Collection", "Datasets", "Files", "Storage", "Linked to publication", "% linked",
+    s_headers = ["Collection", "Datasets", "Files", "Storage used", "Linked to publication", "% linked",
                  "Updated after first version", "Sub-collections"]
-    s_rows = [[u["short"], u["datasets"], u["files"], fmt_bytes(u["bytes"]), u["linked_to_publication"],
+    s_rows = [[u["short"], u["datasets"], u["files"], fmt_bytes(u.get("storage_bytes")), u["linked_to_publication"],
                pct(u["linked_to_publication"], u["datasets"]), u["updated_after_v1"], u["subcollections"]]
               for u in ordered]
     s_total = ["Total", total_ds, total_files, fmt_bytes(total_bytes), linked, pct(linked, total_ds),
                sum(u["updated_after_v1"] for u in ordered), sum(u["subcollections"] for u in ordered)]
     write_csv("storage_linkage_structure.csv", s_headers,
-              [[r[0], r[1], r[2], u["bytes"]] + r[4:] for r, u in zip(s_rows, ordered)])
+              [[r[0], r[1], r[2], u.get("storage_bytes")] + r[4:] for r, u in zip(s_rows, ordered)])
 
     # ---- deposit vs publication
     d_headers = ["Year", "Created that year (and since published)", "First published that year", "Difference"]
@@ -790,7 +823,8 @@ def build_report(units: list[dict], access: dict, version: str, nav: str = "") -
     kpis = [
         ("Published datasets", fmt(total_ds), f"{other_share} outside the six faculties"),
         (f"Published in {this_year}", fmt(pub_this_year), f"{fmt(pub_last_year)} in {this_year - 1} (full year)"),
-        ("Files", fmt(total_files), fmt_bytes(total_bytes) + " in total"),
+        ("Files", fmt(total_files), (fmt_bytes(total_bytes) + " storage used, incl. drafts")
+         if total_bytes is not None else "storage not available"),
         ("Restricted files", pct(restricted, total_files), f"{fmt(restricted)} files"),
         ("Linked to a publication", pct(linked, total_ds), f"{fmt(linked)} datasets"),
     ]
@@ -798,6 +832,10 @@ def build_report(units: list[dict], access: dict, version: str, nav: str = "") -
         f'<div class="kpi"><div class="kpi-l">{esc(a)}</div><div class="kpi-v">{b}</div><div class="kpi-s">{esc(c)}</div></div>'
         for a, b, c in kpis)
 
+    storage_note = ""
+    if missing_storage:
+        storage_note = (" Not available in this run for: " + ", ".join(missing_storage)
+                        + " (the API token is missing or lacks permission).")
     generated = now.strftime("%d %B %Y, %H:%M")
     css = CSS
     js_data = json.dumps({"years": chart_years, "series": chart_series})
@@ -871,6 +909,9 @@ per project instead of depositing in the department collection.</dd>
 <li>Six collections are treated as faculties; the others are listed separately so that they are not silently dropped ({other_share} of all datasets).</li>
 <li>Subject metadata is not used for the breakdown: most datasets carry the default subject, so a subject split would be misleading.</li>
 <li>Views and citations are not reported: Make Data Count statistics are not available for these datasets on DataverseNL.</li>
+<li><strong>Storage used</strong> is the space DataverseNL uses for each collection: files in published <em>and</em> unpublished
+datasets, each file counted once, as reported by DataverseNL's storage-size function (the same figure as DANS's storage exports).
+Units are decimal: 1 GB = 1,000,000,000 bytes, 1 TB = 1,000 GB.{storage_note}</li>
 </ul></section>
 
 <section class="annex"><h2>Annex: dataset downloads per year</h2>
@@ -1455,6 +1496,8 @@ def main() -> int:
           f"; access requests: {'on' if INCLUDE_ACCESS_REQUESTS else 'off'}")
 
     version = get("/api/info/version")["data"].get("version", "unknown")
+    global STORAGE_TOTAL
+    STORAGE_TOTAL = storage_size(ROOT_ALIAS)
     units = get_units()
     print(f"Found {len(units)} top-level collections. Collecting:")
     data = [collect_unit(u) for u in units]
