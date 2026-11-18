@@ -42,20 +42,20 @@ jobs:
           INCLUDE_ACCESS_REQUESTS: ${{ (github.event_name == 'schedule' || inputs.include_access_requests) && 'true' || 'false' }}
           # Titles of never-published drafts are left off the public website; set to "true" to show them.
           PUBLISH_DRAFT_TITLES: "false"
-          LOGO_PATH: assets/um-logo.png
+          # Institution name, collection, logo, colours and faculties: institution.json
         run: python dataverse_report.py
 
-      - name: Upload public report
+      - name: Upload executive report and CSVs
         uses: actions/upload-artifact@v6
         with:
-          name: dataverse-report-${{ github.run_number }}
+          name: executive-report-${{ github.run_number }}
           path: output/public/
           retention-days: 90
 
-      - name: Upload admin page
+      - name: Upload admin report
         uses: actions/upload-artifact@v6
         with:
-          name: dataverse-ADMIN-${{ github.run_number }}
+          name: admin-report-${{ github.run_number }}
           path: output/admin/
           retention-days: 30
 

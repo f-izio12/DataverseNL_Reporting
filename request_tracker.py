@@ -199,7 +199,7 @@ def update_state(state: dict, snapshot: dict, today: str) -> dict:
                 state["requests"][key].update(closed=today, closed_reason="decided")
                 stats["decided"] += 1
 
-    # Open requests on files that are no longer restricted (made public, deleted, moved out of UM)
+    # Open requests on files that are no longer restricted (made public, deleted, moved out of the collection)
     for key, r in state["requests"].items():
         if r["closed"] is None and r["file_id"] not in files_now:
             r.update(closed=today, closed_reason="file_no_longer_restricted")

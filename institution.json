@@ -1,0 +1,44 @@
+{
+  "_help": "Everything specific to one institution. Another institution copies this file and changes the values. Texts with 'en' and 'nl' appear in the English and Dutch reports.",
+
+  "dataverse_url": "https://dataverse.nl",
+  "root_alias": "maastricht",
+
+  "name": {"en": "Maastricht University", "nl": "Universiteit Maastricht"},
+  "short_name": "UM",
+  "department": {"en": "University Library · Research Data Management",
+                 "nl": "Universiteitsbibliotheek · Research Data Management"},
+
+  "logo": "assets/um-logo.png",
+  "colours": {
+    "_help": "primary: headings, links, main chart colour. accent: second chart colour and highlights. Hex codes.",
+    "primary": "#001c3d",
+    "accent": "#e84e10"
+  },
+
+  "default_language": "en",
+  "timezone": "Europe/Amsterdam",
+
+  "main_units": {
+    "_help": "Top-level collections that are the institution's main units (faculties, schools). Alias: short name. Every other top-level collection is shown as 'other collections'.",
+    "FacultyofPsychologyandNeuroscience": "FPN",
+    "SBE-UM": "SBE",
+    "FHML": "FHML",
+    "FASoS": "FASoS",
+    "law": "Law",
+    "FSE": "FSE"
+  },
+  "main_unit_label": {
+    "en": {"one": "faculty", "many": "faculties"},
+    "nl": {"one": "faculteit", "many": "faculteiten"}
+  },
+
+  "other_short_names": {
+    "_help": "Optional short names for the other top-level collections. Without one, the collection's own name is used.",
+    "UNU-MERIT": "UNU-MERIT",
+    "DataHub": "DataHub",
+    "MUMC": "MUMC+",
+    "UB-UM": "Library",
+    "Zuyderland": "Zuyderland"
+  }
+}
