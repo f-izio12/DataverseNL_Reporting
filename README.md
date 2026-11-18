@@ -4,6 +4,9 @@ Monthly reports on an institution's research data in [DataverseNL](https://datav
 and Dutch, plus a daily tracker of access requests. Built at Maastricht University Library and set up
 so that any institution with a DataverseNL collection can use it by changing one settings file.
 
+**Setting it up for your institution? Start with the [setup guide](docs/SETUP_GUIDE.md):** step by step,
+no programming needed.
+
 Two reports, each in English and Dutch:
 
 - **Executive report**, for management: headline figures, trends in charts, the faculties compared,
@@ -48,6 +51,7 @@ report_text.py                                all report text, English and Dutch
 request_tracker.py                            daily snapshot of the access-request queue
 data/access_requests.json                     access-request history, written by the tracker (do not edit)
 assets/                                       logo
+docs/SETUP_GUIDE.md                           step-by-step setup for a new institution
 .github/workflows/dataverse-report.yml        monthly reports and website (GitHub)
 .github/workflows/access-request-tracker.yml  daily access-request snapshot (GitHub)
 requirements.txt                              Python dependencies

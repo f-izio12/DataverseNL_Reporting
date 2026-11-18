@@ -593,7 +593,8 @@ class Page:
         lead = self.t("req_lead", start=esc(self.date(s["started"])), start_year=s["started"][:4],
                       keep=REQUEST_YEARS_SHOWN, last=esc(self.date(s["last_run"])))
         out = f'<p class="lead">{lead}</p>' + self.table(headers, rows, total, cls="req")
-        info = f'<p>{self.t("req_note_requests")}</p><p>{self.t("req_note_median")}</p>'
+        info = (f'<p>{self.t("req_note_requests")}</p><p>{self.t("req_note_median")}</p>'
+                f'<p>{self.t("req_note_sameday")}</p>')
         if full:
             precision = (self.t("precision_day") if s["max_gap"] <= 1 else self.t("precision_gap", n=s["max_gap"]))
             extra = self.t("req_note_decision", precision=precision)
@@ -899,13 +900,24 @@ def build_admin(m: dict, lang: str, links: dict, website: bool) -> str:
                             p.collection_link(i["collection_alias"], i["collection"]), i["files"]] for i in np_items],
                           num={3}, wrap={1, 2})
             + "</details>")
-        summary = (p.heading("h3", p.t("per_collection"))
-                   + p.table([p.t("collection"), p.t("col_restricted_checked"), p.t("col_files_with_requests"),
-                              p.t("col_pending"), p.t("col_no_permission"), p.t("col_errors")], a_rows, a_total))
+        s_headers = [p.t("collection"), p.t("col_restricted_checked"), p.t("col_files_with_requests"),
+                     p.t("col_pending"), p.t("col_no_permission"), p.t("col_errors")]
+        s_info = ""
+        tr = m["tracker"]
+        if tr:
+            since = p.date(tr["started"])
+            s_headers += [p.t("col_since_requests", date=since), p.t("col_since_decided", date=since)]
+            byu = tr["by_unit_year"]
+            for r in a_rows:
+                cells = byu.get(r[0], {}).values()
+                r += [sum(c.get("new", 0) for c in cells), sum(c.get("decided", 0) for c in cells)]
+            a_total += [sum(r[6] for r in a_rows), sum(r[7] for r in a_rows)]
+            s_info = f'<p>{p.t("per_collection_note")}</p>'
+        summary = p.heading("h3", p.t("per_collection"), s_info) + p.table(s_headers, a_rows, a_total)
         waiting_html = (
             p.heading("h3", p.t("waiting_list_title"), waiting_info) + waiting_list
             + (f'<p class="note warn">{p.t("no_perm_warn", n=p.n(no_perm))}</p>' if no_perm else "")
-            + p.pair(summary, no_perm_groups) + no_perm_list)
+            + summary + no_perm_groups + no_perm_list)
     else:
         waiting_html = f'<p class="note">{esc(p.t("queue_not_checked", reason=p.reason(acc.get("reason", ""))))}</p>'
         if m["tracker"]:
@@ -991,9 +1003,17 @@ def build_admin(m: dict, lang: str, links: dict, website: bool) -> str:
                 ("no-licence", "sec_no_licence", "nav_no_licence", "no_licence", licence_html),
                 ("detail", "sec_detail", "nav_detail", None, detail_html),
                 ("method", "sec_method", "nav_method", None, method_html)]
-    body = "".join(f'<section id="{sid}" aria-labelledby="h-{sid}">{p.heading("h2", p.t(h), infos.get(sid, ""), f"h-{sid}")}'
-                   f'{c}</section>'
-                   for sid, h, _n, _k, c in sections)
+    parts = {sid: f'<section id="{sid}" aria-labelledby="h-{sid}">{p.heading("h2", p.t(h), infos.get(sid, ""), f"h-{sid}")}'
+                  f'{c}</section>' for sid, h, _n, _k, c in sections}
+    side_by_side = hide_titles or not dr["enabled"]  # the drafts section is then a short table, not a long list
+    body = ""
+    for sid, *_ in sections:
+        if sid == "requests" and side_by_side:
+            body += f'<div class="pair secpair">{parts["requests"]}{parts["drafts"]}</div>'
+        elif sid == "drafts" and side_by_side:
+            continue
+        else:
+            body += parts[sid]
     return p.frame(p.t("title_admin"), p.t("desc_admin", name=name), f'{p.t("report_admin")} · {p.setting("department")}',
                    p.t("admin_intro"), [(sid, lab(nk, k)) for sid, _h, nk, k, _c in sections], body,
                    extra_head='<meta name="robots" content="noindex">\n')
@@ -1235,7 +1255,10 @@ figure{margin:0}
 .tbl{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px;margin:8px 0;box-shadow:var(--shadow);width:fit-content;max-width:100%}
 .tbl.full{width:auto}
 .pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:8px 24px;align-items:start}
-.pair>div{min-width:0}
+.pair>div,.pair>section{min-width:0}
+.secpair{border-top:1px solid var(--line);margin-top:20px}
+.secpair>section{border-top:none;margin-top:0}
+section+.secpair,.secpair+section{border-top:1px solid var(--line)}
 .pair .card{height:100%}
 .hwrap{display:flex;align-items:center;gap:10px;margin:24px 0 8px}
 .hwrap>h2,.hwrap>h3{margin:0}

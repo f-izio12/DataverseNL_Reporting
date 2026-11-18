@@ -268,7 +268,10 @@ def summarise(state: dict, today: str | None = None) -> dict:
 # --------------------------------------------------------------------------
 def main() -> int:
     if not dr.API_TOKEN:
-        raise SystemExit("DATAVERSE_API_TOKEN is missing: the queue can only be read with a curator token.")
+        # Not an error: a fresh copy of the repository has no token yet. Skip quietly, with a visible notice.
+        print("::notice::Access-request tracker skipped: no DATAVERSE_API_TOKEN secret is set. "
+              "Add the secret to start tracking (see the README).")
+        return 0
     if len(HASH_KEY) < 16:
         raise SystemExit("REQUESTER_HASH_KEY is missing or shorter than 16 characters. "
                          "Add it as a repository secret; without it requests cannot be stored safely.")

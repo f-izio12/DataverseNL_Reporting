@@ -45,11 +45,20 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ ! -f data/access_requests.json ]; then
+            echo "No history yet (the tracker was skipped). Nothing to save."
+            exit 0
+          fi
           git add data/access_requests.json
           if git diff --cached --quiet; then
             echo "No changes to save."
             exit 0
           fi
           git commit -m "Access-request tracker: $(date -u +%Y-%m-%d)"
-          git pull --rebase
-          git push
+          # GitHub occasionally refuses a push for a moment: try three times before giving up.
+          for attempt in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            echo "Push failed (attempt $attempt); retrying in 30 seconds."
+            sleep 30
+          done
+          exit 1
